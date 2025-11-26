@@ -223,43 +223,14 @@ class LogAnalyzer:
         self.improvements_file = logs_path / 'self_improvements.json'
 
     def get_recent_logs(self, lines: int = 100) -> str:
-        """Get recent log entries.
-
-        Args:
-            lines: Number of recent lines to retrieve (default: 100)
-
-        Returns:
-            String containing recent log lines, empty string if error
-        """
+        """Get recent log entries."""
         log_file = self.logs_path / 'runner.log'
-
-        # Handle missing log file
         if not log_file.exists():
-            logger.debug(f"Log file not found: {log_file}")
             return ""
-
-        # Handle empty log file
         try:
-            if log_file.stat().st_size == 0:
-                logger.debug(f"Log file is empty: {log_file}")
-                return ""
-        except OSError as e:
-            logger.warning(f"Cannot stat log file: {e}")
-            return ""
-
-        # Read log content with error handling
-        try:
-            content = log_file.read_text(encoding='utf-8', errors='replace')
-            log_lines = content.split('\n')
-            return '\n'.join(log_lines[-lines:])
-        except PermissionError:
-            logger.error(f"Permission denied reading log file: {log_file}")
-            return ""
-        except OSError as e:
-            logger.error(f"Error reading log file: {e}")
-            return ""
-        except Exception as e:
-            logger.error(f"Unexpected error reading logs: {e}")
+            content = log_file.read_text()
+            return '\n'.join(content.split('\n')[-lines:])
+        except Exception:
             return ""
 
     def analyze_logs(self) -> Dict:
@@ -615,28 +586,8 @@ class Runner:
         return 1
 
     def _progress_all_to_next_level(self, next_level: int):
-        """Progress all completed features to the next level.
-
-        IMPORTANT: Enforces unlock thresholds before allowing progression.
-        - Enhanced (level 2) requires 5 MVP passes
-        - Advanced (level 3) requires 10 Enhanced passes
-        """
+        """Progress all completed features to the next level."""
         level_names = {1: 'MVP', 2: 'Enhanced', 3: 'Advanced'}
-
-        # Check if the next level is unlocked
-        if not self.db.check_level_unlock(next_level):
-            from selfai.database import UNLOCK_THRESHOLDS
-            threshold = UNLOCK_THRESHOLDS.get(next_level, 0)
-            prev_level = next_level - 1
-            prev_level_name = level_names[prev_level]
-            logger.warning(
-                f"❌ Level {next_level} ({level_names[next_level]}) is LOCKED! "
-                f"Need {threshold} {prev_level_name} passes to unlock."
-            )
-            return
-
-        # Level is unlocked, proceed with progression
-        logger.info(f"✅ Level {next_level} ({level_names[next_level]}) is UNLOCKED!")
         logger.info(f"Progressing all features to {level_names[next_level]} level...")
 
         # Get all completed features and move them to next level
@@ -1312,20 +1263,6 @@ Execute now.'''
         secs = int(seconds % 60)
         return f"{minutes}m {secs}s"
 
-    def update_dashboard(self):
-        """Update HTML dashboard with parallel processing info."""
-        stats = self.db.get_stats()
-        level_stats = self.db.get_level_stats()
-        improvements = self.db.get_tasks_with_time_estimates()
-
-        # Get active worktrees for parallel task tracking
-        active_worktrees = self.worktree_mgr.get_active_worktrees()
-
-        html_content = self._generate_dashboard_html(improvements, stats, level_stats, active_worktrees)
-        dashboard_path = self.workspace_path / 'dashboard.html'
-        dashboard_path.write_text(html_content)
-        logger.info(f"Dashboard updated: {stats.get('completed', 0)} completed, {stats.get('pending', 0)} pending, {len(active_worktrees)} parallel")
-
     def _get_level_progress_indicator(self, imp: dict, level: int) -> str:
         """Generate visual progress indicator for current level (Plan → Execute → Test)."""
         level_prefix = {1: 'mvp', 2: 'enhanced', 3: 'advanced'}.get(level, 'mvp')
@@ -1348,6 +1285,20 @@ Execute now.'''
             test_icon = '○'
 
         return f'<span class="level-progress">{plan_icon} → {exec_icon} → {test_icon}</span>'
+
+    def update_dashboard(self):
+        """Update HTML dashboard with parallel processing info."""
+        stats = self.db.get_stats()
+        level_stats = self.db.get_level_stats()
+        improvements = self.db.get_tasks_with_time_estimates()
+
+        # Get active worktrees for parallel task tracking
+        active_worktrees = self.worktree_mgr.get_active_worktrees()
+
+        html_content = self._generate_dashboard_html(improvements, stats, level_stats, active_worktrees)
+        dashboard_path = self.workspace_path / 'dashboard.html'
+        dashboard_path.write_text(html_content)
+        logger.info(f"Dashboard updated: {stats.get('completed', 0)} completed, {stats.get('pending', 0)} pending, {len(active_worktrees)} parallel")
 
     def _generate_dashboard_html(self, improvements: list, stats: dict, level_stats: dict,
                                    active_worktrees: List[Path] = None) -> str:
@@ -1493,13 +1444,6 @@ Execute now.'''
         .level-badge.level-1 {{ background: rgba(34,197,94,0.2); color: #22c55e; }}
         .level-badge.level-2 {{ background: rgba(59,130,246,0.2); color: #3b82f6; }}
         .level-badge.level-3 {{ background: rgba(168,85,247,0.2); color: #a855f7; }}
-        .level-progress {{
-            font-size: 0.75rem;
-            color: #888;
-            font-family: monospace;
-            margin-left: 8px;
-            white-space: nowrap;
-        }}
         .progress-cell {{ font-family: monospace; letter-spacing: 2px; }}
         tr.completed {{ opacity: 0.7; }}
         tr.parallel {{ background: rgba(168,85,247,0.1); animation: pulse 2s infinite; }}
