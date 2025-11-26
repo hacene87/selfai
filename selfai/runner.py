@@ -400,9 +400,13 @@ class WorktreeManager:
             feature_id: Feature ID to cleanup
 
         Note:
-            This method logs errors but does not raise exceptions to allow
-            cleanup to continue even if some operations fail.
+            DISABLED: Worktrees are now kept for debugging and to prevent race conditions.
+            Manual cleanup can be done via: git worktree prune && rm -rf .selfai_data/worktrees/*
         """
+        # DISABLED - Don't delete worktrees to prevent race conditions
+        logger.debug(f"Worktree cleanup skipped for feature #{feature_id} (cleanup disabled)")
+        return
+
         worktree_path = self.worktrees_path / f"wt-{feature_id}"
 
         if not worktree_path.exists():
@@ -1377,7 +1381,7 @@ SUCCESS = Feature is production-ready with full coverage"""
         updated = self.db.get_by_id(imp_id)
         if not updated:
             logger.warning(f"Could not find feature #{imp_id} in database after test")
-            self.worktree_mgr.cleanup_worktree(imp_id)
+            # NOTE: Don't cleanup here - worktree will be reused or cleaned up on next create
             return
 
         test_status = updated.get(f'{level_col}_test_status', 'pending')
@@ -1388,16 +1392,21 @@ SUCCESS = Feature is production-ready with full coverage"""
             success, msg = self.worktree_mgr.merge_to_main(imp_id, title)
             if success:
                 logger.info(f"✓ Merged feature #{imp_id} to main: {title}")
+                # Cleanup worktree only after successful merge
+                self.worktree_mgr.cleanup_worktree(imp_id)
             elif 'CONFLICT' in msg:
                 # Try to resolve conflicts
                 logger.warning(f"Conflicts in #{imp_id}, attempting resolution...")
                 if self.worktree_mgr.resolve_conflicts(self.CLAUDE_CMD, title):
                     logger.info(f"✓ Resolved conflicts and merged #{imp_id}")
+                    # Cleanup after conflict resolution and merge
+                    self.worktree_mgr.cleanup_worktree(imp_id)
                 else:
                     logger.error(f"✗ Could not resolve conflicts for #{imp_id}")
-
-        # Cleanup worktree
-        self.worktree_mgr.cleanup_worktree(imp_id)
+                    # Keep worktree for manual inspection
+        else:
+            # Test failed or pending - keep worktree for debugging
+            logger.debug(f"Keeping worktree for #{imp_id} (test status: {test_status})")
 
     def _quick_syntax_check(self) -> bool:
         """Quick syntax validation before full test - saves time on obvious errors."""
@@ -1526,18 +1535,59 @@ After completing all steps, output ONLY this JSON:
         return criteria.get(level, criteria[1])
 
     def _parse_test_result(self, output: str) -> bool:
-        """Parse test output to determine pass/fail."""
+        """Parse test output to determine pass/fail with validation and confidence scoring."""
+        if not output or not output.strip():
+            logger.warning("Empty test output - marking as failed")
+            return False
+
         output_lower = output.lower()
+
+        try:
+            start = output.find('```json')
+            end = output.find('```', start + 7) if start != -1 else -1
+
+            if start != -1 and end != -1:
+                json_str = output[start + 7:end].strip()
+                try:
+                    data = json.loads(json_str)
+                    if isinstance(data, dict) and 'test_passed' in data:
+                        result = data['test_passed']
+                        if isinstance(result, bool):
+                            logger.info(f"Parsed test result from JSON: {result}")
+                            return result
+                        else:
+                            logger.warning(f"test_passed is not boolean: {type(result)}")
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse JSON in test output: {e}")
+        except Exception as e:
+            logger.warning(f"Error extracting JSON from test output: {e}")
+
         if '"test_passed": true' in output_lower or '"test_passed":true' in output_lower:
+            logger.info("Found test_passed=true via string search")
             return True
         if '"test_passed": false' in output_lower or '"test_passed":false' in output_lower:
+            logger.info("Found test_passed=false via string search")
             return False
-        # Heuristic fallback
-        fail_indicators = ['failed', 'error', 'exception', 'not working', 'broken']
-        pass_indicators = ['passed', 'success', 'working', 'verified', 'complete']
-        fail_count = sum(1 for i in fail_indicators if i in output_lower)
-        pass_count = sum(1 for i in pass_indicators if i in output_lower)
-        return pass_count > fail_count
+
+        fail_indicators = ['failed', 'error', 'exception', 'not working', 'broken', 'traceback', 'importerror', 'syntaxerror']
+        pass_indicators = ['passed', 'success', 'working', 'verified', 'complete', 'ok', 'all tests', 'no errors']
+
+        fail_count = sum(1 for indicator in fail_indicators if indicator in output_lower)
+        pass_count = sum(1 for indicator in pass_indicators if indicator in output_lower)
+
+        confidence = abs(pass_count - fail_count)
+        total_indicators = pass_count + fail_count
+
+        if total_indicators == 0:
+            logger.warning("No test indicators found in output - assuming failed")
+            return False
+
+        result = pass_count > fail_count
+        confidence_pct = (confidence / total_indicators * 100) if total_indicators > 0 else 0
+
+        logger.info(f"Heuristic parse: pass={pass_count}, fail={fail_count}, confidence={confidence_pct:.1f}%, result={result}")
+
+        return result
 
     def _discover_existing_features(self):
         """Analyze codebase and catalog HIGH-LEVEL features (not functions)."""
@@ -1797,7 +1847,6 @@ Remember: Quality over quantity. Only suggest features that truly matter.'''
 
         if output:
             # If using worktree, commit changes BEFORE marking completed
-            # This prevents race condition where cleanup happens before commit
             if work_dir:
                 self._commit_worktree_changes(work_dir, imp_id, title, level_name)
 
@@ -1808,25 +1857,115 @@ Remember: Quality over quantity. Only suggest features that truly matter.'''
             logger.error(f"✗ {level_name} failed: {title}")
 
     def _commit_worktree_changes(self, work_dir: Path, imp_id: int, title: str, level_name: str):
-        """Commit changes made in a worktree."""
+        """Commit changes made in a worktree.
+
+        Uses a fallback strategy: tries to commit in worktree first,
+        but if worktree is gone, commits via main repo checkout.
+        """
+        branch_name = self.worktree_mgr._sanitize_branch_name(f"{imp_id}-{title}")
+        commit_msg = f"[SelfAI] {level_name}: {title}\n\nFeature #{imp_id}"
+
+        # Strategy 1: Try to commit in worktree (preferred - faster)
         try:
-            # Check if worktree still exists
-            if not work_dir.exists():
-                logger.warning(f"Worktree {work_dir} no longer exists, skipping commit for #{imp_id}")
+            if work_dir.exists():
+                # Check if there are changes to commit
+                status_result = subprocess.run(
+                    ['git', 'status', '--porcelain'],
+                    cwd=str(work_dir),
+                    capture_output=True,
+                    timeout=10,
+                    text=True
+                )
+
+                if not status_result.stdout.strip():
+                    logger.debug(f"No changes to commit for #{imp_id}")
+                    return
+
+                # Add all changes
+                subprocess.run(
+                    ['git', 'add', '-A'],
+                    cwd=str(work_dir),
+                    capture_output=True,
+                    timeout=30,
+                    check=True
+                )
+
+                # Commit
+                subprocess.run(
+                    ['git', 'commit', '-m', commit_msg],
+                    cwd=str(work_dir),
+                    capture_output=True,
+                    timeout=30,
+                    check=True
+                )
+
+                logger.info(f"Committed changes for #{imp_id} in worktree")
                 return
 
-            # Add all changes
-            subprocess.run(['git', 'add', '-A'], cwd=str(work_dir), capture_output=True)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+            logger.warning(f"Worktree commit failed for #{imp_id}: {e}, trying fallback...")
 
-            # Commit
-            commit_msg = f"[SelfAI] {level_name}: {title}\n\nFeature #{imp_id}"
+        # Strategy 2: Fallback - commit via main repo checkout
+        try:
+            logger.info(f"Using fallback: committing #{imp_id} via main repo checkout")
+
+            # Stash any changes in main repo
             subprocess.run(
-                ['git', 'commit', '-m', commit_msg],
-                cwd=str(work_dir), capture_output=True
+                ['git', 'stash', 'push', '-m', f'Auto-stash before #{imp_id} commit'],
+                cwd=str(self.worktree_mgr.repo_path),
+                capture_output=True,
+                timeout=30
             )
-            logger.info(f"Committed changes for #{imp_id} in worktree")
+
+            # Checkout the feature branch
+            result = subprocess.run(
+                ['git', 'checkout', branch_name],
+                cwd=str(self.worktree_mgr.repo_path),
+                capture_output=True,
+                timeout=30
+            )
+
+            if result.returncode != 0:
+                logger.warning(f"Could not checkout branch {branch_name}: {result.stderr.decode()}")
+                return
+
+            # Add and commit changes
+            subprocess.run(
+                ['git', 'add', '-A'],
+                cwd=str(self.worktree_mgr.repo_path),
+                capture_output=True,
+                timeout=30,
+                check=True
+            )
+
+            subprocess.run(
+                ['git', 'commit', '-m', commit_msg, '--allow-empty'],
+                cwd=str(self.worktree_mgr.repo_path),
+                capture_output=True,
+                timeout=30,
+                check=True
+            )
+
+            logger.info(f"Committed changes for #{imp_id} via fallback method")
+
+            # Return to main branch
+            subprocess.run(
+                ['git', 'checkout', 'main'],
+                cwd=str(self.worktree_mgr.repo_path),
+                capture_output=True,
+                timeout=30
+            )
+
+            # Restore stashed changes
+            subprocess.run(
+                ['git', 'stash', 'pop'],
+                cwd=str(self.worktree_mgr.repo_path),
+                capture_output=True,
+                timeout=30
+            )
+
         except Exception as e:
-            logger.warning(f"Failed to commit worktree changes: {e}")
+            logger.error(f"Both worktree and fallback commit failed for #{imp_id}: {e}")
 
     def _create_plan(self, improvement: Dict, level: int, work_dir: Path = None) -> Optional[str]:
         """Create execution plan for specific level."""
