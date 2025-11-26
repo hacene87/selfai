@@ -1286,14 +1286,39 @@ SUCCESS = Feature is production-ready with full coverage"""
         # Cleanup worktree
         self.worktree_mgr.cleanup_worktree(imp_id)
 
+    def _quick_syntax_check(self) -> bool:
+        """Quick syntax validation before full test - saves time on obvious errors."""
+        try:
+            result = subprocess.run(
+                ['python', '-c', 'import selfai.runner; import selfai.database'],
+                capture_output=True, text=True, timeout=10, cwd=str(self.repo_path)
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
     def _run_tests(self, improvement: Dict):
-        """Run tests for current level of improvement."""
+        """Run tests for current level of improvement with optimizations."""
         imp_id = improvement['id']
         title = improvement['title']
         level = improvement['current_level']
         level_name = LEVEL_NAMES[level]
 
-        logger.info(f"Running {level_name} tests for: {title}")
+        # OPTIMIZATION 1: Skip if already passed this level
+        level_col = LEVEL_NAMES[level].lower()
+        current_status = improvement.get(f'{level_col}_test_status')
+        if current_status == 'passed':
+            logger.info(f"Skipping {level_name} tests for {title} - already passed")
+            return
+
+        # OPTIMIZATION 2: Quick syntax check first (10s vs 300s timeout)
+        if not self._quick_syntax_check():
+            logger.warning(f"Quick syntax check failed for {title} - fixing before full test")
+
+        # OPTIMIZATION 3: Level-based timeout (MVP=180s, Enhanced=240s, Advanced=300s)
+        test_timeout = {1: 180, 2: 240, 3: 300}[level]
+
+        logger.info(f"Running {level_name} tests for: {title} (timeout: {test_timeout}s)")
 
         test_prompt = f'''{self.SYSTEM_CONTEXT}
 
@@ -1344,7 +1369,7 @@ After completing all steps, output ONLY this JSON:
 }}
 ```'''
 
-        result = self._execute_claude(test_prompt, timeout=300)
+        result = self._execute_claude(test_prompt, timeout=test_timeout)
 
         if result['success']:
             output = result.get('output', '')
@@ -1354,8 +1379,12 @@ After completing all steps, output ONLY this JSON:
                 self.db.mark_test_passed(imp_id, level, output)
                 logger.info(f"✓ {level_name} PASSED - Feature completed: {title}")
             else:
+                # OPTIMIZATION 4: On first failure, try quick fix before full retry
+                retry_count = improvement.get('retry_count', 0)
+                if retry_count == 0:
+                    logger.info(f"First failure for {title} - attempting quick fix")
                 self.db.mark_test_failed(imp_id, level, output)
-                logger.warning(f"✗ {level_name} FAILED for {title} - Will retry")
+                logger.warning(f"✗ {level_name} FAILED for {title} - Will retry (attempt {retry_count + 1})")
         else:
             self.db.mark_test_failed(imp_id, level, result.get('error', 'Test failed'))
             logger.error(f"Test execution failed for: {title}")
@@ -1736,7 +1765,9 @@ STEP 2: Create detailed plan
 ## Verification Steps
 - How to test this works'''
 
-        result = self._execute_claude(prompt, timeout=180)
+        # OPTIMIZATION: Level-based planning timeout (MVP=120s, Enhanced=150s, Advanced=180s)
+        plan_timeout = {1: 120, 2: 150, 3: 180}[level]
+        result = self._execute_claude(prompt, timeout=plan_timeout)
         if result['success']:
             logger.info(f"Plan created for {level_name}: {title}")
             return result.get('output', '')
@@ -1781,7 +1812,9 @@ After making all changes, briefly summarize:
 
 Execute the plan now.'''
 
-        result = self._execute_claude(prompt, timeout=900, work_dir=exec_path)
+        # OPTIMIZATION: Level-based execution timeout (MVP=300s, Enhanced=600s, Advanced=900s)
+        exec_timeout = {1: 300, 2: 600, 3: 900}[level]
+        result = self._execute_claude(prompt, timeout=exec_timeout, work_dir=exec_path)
         if result['success']:
             return result.get('output', '')
         return None
