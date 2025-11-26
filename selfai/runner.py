@@ -586,8 +586,28 @@ class Runner:
         return 1
 
     def _progress_all_to_next_level(self, next_level: int):
-        """Progress all completed features to the next level."""
+        """Progress all completed features to the next level.
+
+        IMPORTANT: Enforces unlock thresholds before allowing progression.
+        - Enhanced (level 2) requires 5 MVP passes
+        - Advanced (level 3) requires 10 Enhanced passes
+        """
         level_names = {1: 'MVP', 2: 'Enhanced', 3: 'Advanced'}
+
+        # Check if the next level is unlocked
+        if not self.db.check_level_unlock(next_level):
+            from selfai.database import UNLOCK_THRESHOLDS
+            threshold = UNLOCK_THRESHOLDS.get(next_level, 0)
+            prev_level = next_level - 1
+            prev_level_name = level_names[prev_level]
+            logger.warning(
+                f"❌ Level {next_level} ({level_names[next_level]}) is LOCKED! "
+                f"Need {threshold} {prev_level_name} passes to unlock."
+            )
+            return
+
+        # Level is unlocked, proceed with progression
+        logger.info(f"✅ Level {next_level} ({level_names[next_level]}) is UNLOCKED!")
         logger.info(f"Progressing all features to {level_names[next_level]} level...")
 
         # Get all completed features and move them to next level

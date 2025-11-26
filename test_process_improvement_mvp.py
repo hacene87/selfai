@@ -324,6 +324,176 @@ def test_merge_after_test_passes():
     finally:
         shutil.rmtree(test_dir, ignore_errors=True)
 
+def test_level_unlock_thresholds():
+    """Test that Enhanced unlocks after 5 MVP passes."""
+    test_dir = tempfile.mkdtemp()
+    try:
+        repo_path = Path(test_dir) / 'test_repo'
+        repo_path.mkdir()
+        runner = Runner(repo_path)
+
+        # Enhanced should be locked initially
+        assert not runner.db.check_level_unlock(2), "Enhanced should be locked initially"
+
+        # Add 5 features and mark them as MVP passed
+        for i in range(5):
+            feat_id = runner.db.add(
+                title=f"Feature {i+1}",
+                description=f"Test feature {i+1}",
+                category="feature",
+                priority=50,
+                source="test"
+            )
+            # Mark as completed at MVP level
+            runner.db.mark_level_completed(feat_id, 1, "test output")
+            runner.db.mark_test_passed(feat_id, 1, "test passed")
+
+        # Enhanced should now be unlocked
+        assert runner.db.check_level_unlock(2), "Enhanced should be unlocked after 5 MVP passes"
+
+        # Advanced should still be locked
+        assert not runner.db.check_level_unlock(3), "Advanced should still be locked"
+
+        print("✓ Test passed: Enhanced unlocks after 5 MVP passes")
+        return True
+    except Exception as e:
+        print(f"✗ Test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+    finally:
+        shutil.rmtree(test_dir, ignore_errors=True)
+
+def test_level_remains_locked():
+    """Test that levels stay locked until threshold is met."""
+    test_dir = tempfile.mkdtemp()
+    try:
+        repo_path = Path(test_dir) / 'test_repo'
+        repo_path.mkdir()
+        runner = Runner(repo_path)
+
+        # Add only 3 features with MVP passed
+        for i in range(3):
+            feat_id = runner.db.add(
+                title=f"Feature {i+1}",
+                description=f"Test feature {i+1}",
+                category="feature",
+                priority=50,
+                source="test"
+            )
+            runner.db.mark_level_completed(feat_id, 1, "test output")
+            runner.db.mark_test_passed(feat_id, 1, "test passed")
+
+        # Enhanced should still be locked (needs 5)
+        assert not runner.db.check_level_unlock(2), "Enhanced should be locked with only 3 MVP passes"
+
+        print("✓ Test passed: Levels stay locked until threshold met")
+        return True
+    except Exception as e:
+        print(f"✗ Test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+    finally:
+        shutil.rmtree(test_dir, ignore_errors=True)
+
+def test_advanced_unlock():
+    """Test that Advanced unlocks after 10 Enhanced passes."""
+    test_dir = tempfile.mkdtemp()
+    try:
+        repo_path = Path(test_dir) / 'test_repo'
+        repo_path.mkdir()
+        runner = Runner(repo_path)
+
+        # Add 10 features with Enhanced passed
+        for i in range(10):
+            feat_id = runner.db.add(
+                title=f"Feature {i+1}",
+                description=f"Test feature {i+1}",
+                category="feature",
+                priority=50,
+                source="test"
+            )
+            # Mark MVP passed
+            runner.db.mark_level_completed(feat_id, 1, "test output")
+            runner.db.mark_test_passed(feat_id, 1, "test passed")
+            # Progress to Enhanced
+            runner.db.enhance_feature(feat_id)
+            # Mark Enhanced passed
+            runner.db.mark_level_completed(feat_id, 2, "test output")
+            runner.db.mark_test_passed(feat_id, 2, "test passed")
+
+        # Advanced should now be unlocked
+        assert runner.db.check_level_unlock(3), "Advanced should be unlocked after 10 Enhanced passes"
+
+        print("✓ Test passed: Advanced unlocks after 10 Enhanced passes")
+        return True
+    except Exception as e:
+        print(f"✗ Test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+    finally:
+        shutil.rmtree(test_dir, ignore_errors=True)
+
+def test_batch_progression_with_locks():
+    """Test full progression flow with unlock gates."""
+    test_dir = tempfile.mkdtemp()
+    try:
+        repo_path = Path(test_dir) / 'test_repo'
+        repo_path.mkdir()
+        runner = Runner(repo_path)
+
+        # Add 3 features at MVP level
+        for i in range(3):
+            feat_id = runner.db.add(
+                title=f"Feature {i+1}",
+                description=f"Test feature {i+1}",
+                category="feature",
+                priority=50,
+                source="test"
+            )
+            runner.db.mark_level_completed(feat_id, 1, "test output")
+            runner.db.mark_test_passed(feat_id, 1, "test passed")
+
+        # Try to progress to Enhanced - should fail (locked, needs 5)
+        runner._progress_all_to_next_level(2)
+
+        # Verify features are still at MVP level (not progressed)
+        features = runner.db.get_all()
+        completed_count = sum(1 for f in features if f['status'] == 'completed')
+        assert completed_count == 3, "Features should remain completed (not moved to pending)"
+
+        # Add 2 more features to reach 5 MVP passes
+        for i in range(3, 5):
+            feat_id = runner.db.add(
+                title=f"Feature {i+1}",
+                description=f"Test feature {i+1}",
+                category="feature",
+                priority=50,
+                source="test"
+            )
+            runner.db.mark_level_completed(feat_id, 1, "test output")
+            runner.db.mark_test_passed(feat_id, 1, "test passed")
+
+        # Now progression should succeed
+        runner._progress_all_to_next_level(2)
+
+        # Verify features moved to pending at Enhanced level
+        features = runner.db.get_all()
+        pending_count = sum(1 for f in features if f['status'] == 'pending' and f['current_level'] == 2)
+        assert pending_count == 5, f"All 5 features should be pending at Enhanced level, got {pending_count}"
+
+        print("✓ Test passed: Batch progression respects unlock gates")
+        return True
+    except Exception as e:
+        print(f"✗ Test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+    finally:
+        shutil.rmtree(test_dir, ignore_errors=True)
+
 if __name__ == '__main__':
     print("Testing MVP implementation of _process_improvement and worktrees...")
     print()
@@ -335,6 +505,13 @@ if __name__ == '__main__':
     results.append(test_worktree_creation())
     results.append(test_parallel_processing_mvp())
     results.append(test_merge_after_test_passes())
+
+    # New unlock threshold tests
+    print("\nTesting unlock threshold system...")
+    results.append(test_level_unlock_thresholds())
+    results.append(test_level_remains_locked())
+    results.append(test_advanced_unlock())
+    results.append(test_batch_progression_with_locks())
 
     print()
     print(f"Results: {sum(results)}/{len(results)} tests passed")
