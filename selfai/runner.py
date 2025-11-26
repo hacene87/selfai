@@ -806,29 +806,69 @@ class Runner:
     RUN_TIMEOUT = 600  # Max seconds per run cycle (10 min)
 
     # Level-specific guidance for plans
+    # System context for all prompts
+    SYSTEM_CONTEXT = """You are an AI agent working on SelfAI - an autonomous self-improving system.
+This system runs as a LaunchAgent every 3 minutes, progressively implementing features through 3 levels:
+MVP → Enhanced → Advanced. You are modifying the selfai/ Python module.
+
+KEY RULES:
+- Make REAL, WORKING changes - not placeholder code
+- Test your changes mentally before committing
+- Keep changes focused on the specific feature
+- Don't break existing functionality
+- Follow Python best practices"""
+
     LEVEL_GUIDANCE = {
-        1: """MVP LEVEL - Keep it simple:
-- Minimal working implementation
-- Core functionality only
-- Basic error handling
-- No edge cases yet
-- Quick implementation (5-10 min)""",
+        1: """MVP LEVEL - Minimal Viable Implementation:
+GOAL: Get basic functionality working quickly
 
-        2: """ENHANCED LEVEL - Make it robust:
-- Build on MVP implementation
-- Handle edge cases
-- Better error messages
-- Input validation
-- More comprehensive tests
-- Medium complexity (10-20 min)""",
+DO:
+- Implement core feature with minimal code
+- Add basic error handling (try/except for critical paths)
+- Make it work for the happy path
+- Use existing patterns in the codebase
 
-        3: """ADVANCED LEVEL - Production ready:
-- Optimize performance
-- Complete error handling
-- Security considerations
-- Comprehensive documentation
-- Full test coverage
-- Production quality (20-30 min)"""
+DON'T:
+- Over-engineer or add unnecessary abstractions
+- Handle every edge case
+- Add extensive documentation
+- Create new files unless absolutely necessary
+
+SUCCESS = Feature works for basic use case""",
+
+        2: """ENHANCED LEVEL - Robust Implementation:
+GOAL: Make the MVP production-worthy
+
+DO:
+- Add input validation for all public methods
+- Handle edge cases (empty inputs, None values, invalid types)
+- Improve error messages with actionable details
+- Add type hints to modified functions
+- Write focused unit tests
+
+DON'T:
+- Rewrite the entire feature
+- Add features beyond the original scope
+- Create complex abstractions
+
+SUCCESS = Feature handles unexpected inputs gracefully""",
+
+        3: """ADVANCED LEVEL - Production Excellence:
+GOAL: Make it bulletproof and maintainable
+
+DO:
+- Optimize performance bottlenecks
+- Add comprehensive logging
+- Implement retry logic where appropriate
+- Add docstrings to public APIs
+- Ensure thread-safety if applicable
+- Add integration tests
+
+DON'T:
+- Make breaking API changes
+- Over-optimize prematurely
+
+SUCCESS = Feature is production-ready with full coverage"""
     }
 
     def __init__(self, repo_path: Path):
@@ -1255,42 +1295,54 @@ class Runner:
 
         logger.info(f"Running {level_name} tests for: {title}")
 
-        test_prompt = f'''You are testing and FIXING a {level_name} implementation.
+        test_prompt = f'''{self.SYSTEM_CONTEXT}
 
-Repository: {self.repo_path}
-Feature: {title}
+=== TESTING AND FIXING: {title} ===
 Level: {level_name} ({level}/3)
+Repository: {self.repo_path}
 Description: {improvement.get('description', '')}
 
 TEST CRITERIA FOR {level_name}:
 {self._get_test_criteria(level)}
 
-YOUR MISSION (in order):
-1. READ the relevant code files to understand what was implemented
-2. VERIFY the implementation works by checking imports, syntax, logic
-3. If ANY issues are found, FIX THEM IMMEDIATELY - don't just report
-4. RUN any existing tests if available
-5. Only mark as PASSED if the feature genuinely works
+=== YOUR MISSION ===
 
-CRITICAL: You MUST try to FIX any issues you find, not just report them!
-- If imports are missing, add them
-- If there are syntax errors, fix them
-- If logic is broken, repair it
-- Be thorough and actually verify the code runs
+STEP 1 - DISCOVER: Find the implementation
+- Use Glob to find relevant files (search for feature-related names)
+- Read the main files: selfai/runner.py, selfai/database.py, selfai/__main__.py
 
-After fixing any issues, report the final status:
+STEP 2 - VERIFY: Check the implementation
+- Verify imports are correct and modules exist
+- Check for syntax errors (run: python -c "import selfai.runner")
+- Trace the logic mentally - does it make sense?
 
-OUTPUT FORMAT:
+STEP 3 - FIX: Repair any issues found
+- Missing imports? ADD them
+- Syntax errors? FIX them
+- Logic bugs? REPAIR them
+- Don't just report - ACTUALLY EDIT the files
+
+STEP 4 - TEST: Run actual tests
+- Execute: python -c "from selfai.runner import Runner; print('OK')"
+- Run any pytest files if they exist
+- Verify the feature works end-to-end
+
+=== CRITICAL RULES ===
+- You MUST fix issues, not just report them
+- A feature only passes if it ACTUALLY WORKS
+- When in doubt, test it by running Python code
+- Be thorough - check all affected files
+
+=== OUTPUT FORMAT ===
+After completing all steps, output ONLY this JSON:
 ```json
 {{
   "test_passed": true/false,
-  "tests_run": ["list of verifications performed"],
-  "issues_fixed": ["list of issues you fixed"],
-  "remaining_issues": ["only issues you could NOT fix"]
+  "tests_run": ["what you verified"],
+  "issues_fixed": ["what you fixed"],
+  "remaining_issues": ["what you couldn't fix"]
 }}
-```
-
-Remember: Your goal is to make this feature WORK, not just test it!'''
+```'''
 
         result = self._execute_claude(test_prompt, timeout=300)
 
@@ -1642,30 +1694,47 @@ Remember: Quality over quantity. Only suggest features that truly matter.'''
             if prev_output:
                 prev_context = f"\nPREVIOUS LEVEL OUTPUT:\n{prev_output[:2000]}"
 
-        prompt = f'''Create a {level_name} implementation plan.
+        prompt = f'''{self.SYSTEM_CONTEXT}
 
-Repository: {exec_path}
-Feature: {title}
-Description: {improvement.get('description', '')}
+=== PLANNING: {title} ===
 Level: {level_name} ({level}/3)
+Repository: {exec_path}
+Description: {improvement.get('description', '')}
 {prev_context}
 
 {self.LEVEL_GUIDANCE[level]}
 
-OUTPUT FORMAT:
-## Analysis
-[What exists, what needs to change]
+=== YOUR TASK ===
+Create a SPECIFIC, ACTIONABLE plan for this feature.
 
-## Plan
-1. [Specific step]
-2. [Specific step]
+STEP 1: Analyze existing code
+- Read selfai/runner.py, selfai/database.py to understand current structure
+- Identify where this feature should be implemented
+- Note any existing similar patterns to follow
+
+STEP 2: Create detailed plan
+- List EXACT files to modify
+- Describe SPECIFIC code changes (not vague descriptions)
+- Estimate lines of code to add/modify
+
+=== OUTPUT FORMAT ===
+## Analysis
+- Current state: [what exists]
+- Gap: [what's missing]
+- Approach: [how to implement]
+
+## Implementation Plan
+1. [File: exact change description]
+2. [File: exact change description]
 ...
 
-## Files to Modify
-- [file]: [changes]
+## Code Snippets (key additions)
+```python
+# Key code you'll add
+```
 
-## Tests to Add
-- [test description]'''
+## Verification Steps
+- How to test this works'''
 
         result = self._execute_claude(prompt, timeout=180)
         if result['success']:
@@ -1680,22 +1749,37 @@ OUTPUT FORMAT:
         level_name = LEVEL_NAMES[level]
         exec_path = work_dir or self.repo_path
 
-        prompt = f'''Execute this {level_name} plan.
+        prompt = f'''{self.SYSTEM_CONTEXT}
 
-Repository: {exec_path}
-Feature: {title}
+=== EXECUTING: {title} ===
 Level: {level_name} ({level}/3)
+Repository: {exec_path}
 
-PLAN:
+PLAN TO EXECUTE:
 {plan}
 
-INSTRUCTIONS:
-1. Follow the plan exactly
-2. Make the code changes
-3. Keep it at {level_name} complexity level
-4. Do NOT create documentation unless specified
+=== EXECUTION RULES ===
+1. Make REAL code changes - use Edit tool to modify files
+2. Follow the plan step by step
+3. After each change, verify it doesn't break imports
+4. Keep changes minimal and focused
+5. DO NOT create new files unless the plan explicitly requires it
+6. DO NOT add comments explaining what you did
 
-Execute now.'''
+=== QUALITY CHECKS ===
+Before finishing, verify:
+- [ ] All imports are valid (no circular imports)
+- [ ] Code syntax is correct
+- [ ] Changes match the {level_name} level requirements
+- [ ] No placeholder code (TODO, FIXME, pass)
+
+=== OUTPUT ===
+After making all changes, briefly summarize:
+- Files modified
+- Key changes made
+- Any issues encountered
+
+Execute the plan now.'''
 
         result = self._execute_claude(prompt, timeout=900, work_dir=exec_path)
         if result['success']:
