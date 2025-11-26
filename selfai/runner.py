@@ -36,120 +36,515 @@ from .database import Database, LEVEL_NAMES
 logger = logging.getLogger('selfai')
 
 
+# Custom Exceptions
+class WorktreeError(Exception):
+    """Base exception for worktree operations."""
+    pass
+
+
+class MergeConflictError(WorktreeError):
+    """Raised when merge conflicts cannot be resolved."""
+    pass
+
+
+class DiskSpaceError(WorktreeError):
+    """Raised when insufficient disk space is available."""
+    pass
+
+
+class ValidationError(WorktreeError):
+    """Raised when input validation fails."""
+    pass
+
+
 class WorktreeManager:
     """Manage git worktrees for parallel task execution."""
+
+    # Constants
+    MIN_DISK_SPACE_MB = 500  # Minimum disk space required (MB)
+    MAX_RETRIES = 3  # Max retries for transient failures
+    RETRY_DELAY = 2  # Base delay between retries (seconds)
 
     def __init__(self, repo_path: Path, workspace_path: Path):
         self.repo_path = repo_path
         self.worktrees_path = workspace_path / 'worktrees'
         self.worktrees_path.mkdir(parents=True, exist_ok=True)
 
-    def _run_git(self, *args, cwd: Path = None) -> Tuple[bool, str]:
-        """Run a git command and return (success, output)."""
+        # Cleanup orphaned worktrees on startup
+        self._cleanup_orphaned_worktrees()
+
+    def _run_git(self, *args, cwd: Path = None, retry: bool = True) -> Tuple[bool, str]:
+        """Run a git command with retry logic and return (success, output)."""
+        retries = self.MAX_RETRIES if retry else 1
+
+        for attempt in range(retries):
+            try:
+                result = subprocess.run(
+                    ['git'] + list(args),
+                    capture_output=True, text=True, timeout=60,
+                    cwd=str(cwd or self.repo_path)
+                )
+                success = result.returncode == 0
+                output = result.stdout + result.stderr
+
+                if success or not retry:
+                    return success, output
+
+                # Retry for transient failures
+                if attempt < retries - 1:
+                    delay = self.RETRY_DELAY * (2 ** attempt)  # Exponential backoff
+                    logger.warning(f"Git command failed (attempt {attempt + 1}/{retries}), retrying in {delay}s: {args}")
+                    time.sleep(delay)
+                    continue
+
+                return False, output
+
+            except subprocess.TimeoutExpired:
+                if attempt < retries - 1:
+                    logger.warning(f"Git command timeout (attempt {attempt + 1}/{retries}), retrying: {args}")
+                    continue
+                return False, "Git command timed out"
+            except Exception as e:
+                if attempt < retries - 1:
+                    logger.warning(f"Git command exception (attempt {attempt + 1}/{retries}): {e}")
+                    continue
+                return False, str(e)
+
+        return False, "All retry attempts failed"
+
+    def validate_improvement(self, improvement: Dict) -> None:
+        """Validate improvement structure.
+
+        Args:
+            improvement: Improvement dict from database
+
+        Raises:
+            ValidationError: If improvement is invalid
+        """
+        if not improvement:
+            raise ValidationError("Improvement is None or empty")
+
+        required_fields = ['id', 'title']
+        for field in required_fields:
+            if field not in improvement or not improvement[field]:
+                raise ValidationError(f"Missing required field: {field}")
+
+        # Validate ID is positive integer
         try:
-            result = subprocess.run(
-                ['git'] + list(args),
-                capture_output=True, text=True, timeout=60,
-                cwd=str(cwd or self.repo_path)
-            )
-            return result.returncode == 0, result.stdout + result.stderr
+            imp_id = int(improvement['id'])
+            if imp_id <= 0:
+                raise ValidationError(f"Invalid improvement ID: {imp_id}")
+        except (ValueError, TypeError) as e:
+            raise ValidationError(f"Invalid improvement ID type: {e}")
+
+        # Validate title length and content
+        title = str(improvement['title'])
+        if len(title) < 3:
+            raise ValidationError(f"Title too short (min 3 chars): {title}")
+        if len(title) > 200:
+            raise ValidationError(f"Title too long (max 200 chars): {title[:50]}...")
+
+    def validate_repository_state(self) -> None:
+        """Validate repository is in clean state.
+
+        Raises:
+            ValidationError: If repository has uncommitted changes
+        """
+        # Check for uncommitted changes
+        success, output = self._run_git('status', '--porcelain', retry=False)
+        if not success:
+            raise ValidationError(f"Cannot check repository status: {output}")
+
+        # Allow changes only in .selfai_data directory
+        if output.strip():
+            lines = [line for line in output.strip().split('\n')
+                    if line and not '.selfai_data' in line]
+            if lines:
+                raise ValidationError(
+                    f"Repository has uncommitted changes. Please commit or stash them first.\n"
+                    f"Changed files: {', '.join([l.strip()[:50] for l in lines[:3]])}"
+                )
+
+    def check_disk_space(self) -> None:
+        """Check available disk space.
+
+        Raises:
+            DiskSpaceError: If insufficient disk space
+        """
+        try:
+            stat = os.statvfs(str(self.worktrees_path))
+            available_mb = (stat.f_bavail * stat.f_frsize) / (1024 * 1024)
+
+            if available_mb < self.MIN_DISK_SPACE_MB:
+                raise DiskSpaceError(
+                    f"Insufficient disk space: {available_mb:.0f}MB available, "
+                    f"{self.MIN_DISK_SPACE_MB}MB required"
+                )
+
+            logger.debug(f"Disk space check OK: {available_mb:.0f}MB available")
+
+        except DiskSpaceError:
+            raise
         except Exception as e:
-            return False, str(e)
+            logger.warning(f"Cannot check disk space: {e}")
+            # Don't fail on disk space check errors
+
+    def _cleanup_orphaned_worktrees(self) -> None:
+        """Cleanup orphaned worktrees from crashed processes."""
+        try:
+            # Get list of worktrees from git
+            success, output = self._run_git('worktree', 'list', '--porcelain', retry=False)
+            if not success:
+                logger.debug("Cannot list worktrees, skipping orphan cleanup")
+                return
+
+            git_worktrees = set()
+            for line in output.split('\n'):
+                if line.startswith('worktree '):
+                    path = Path(line.replace('worktree ', '').strip())
+                    if 'wt-' in path.name:
+                        git_worktrees.add(path)
+
+            # Get worktree directories on disk
+            disk_worktrees = set()
+            if self.worktrees_path.exists():
+                disk_worktrees = {p for p in self.worktrees_path.iterdir()
+                                 if p.is_dir() and p.name.startswith('wt-')}
+
+            # Find orphans (in disk but not in git, or vice versa)
+            orphaned_on_disk = disk_worktrees - git_worktrees
+            orphaned_in_git = git_worktrees - disk_worktrees
+
+            # Cleanup orphaned directories
+            for orphan in orphaned_on_disk:
+                try:
+                    logger.info(f"Removing orphaned worktree directory: {orphan.name}")
+                    shutil.rmtree(orphan, ignore_errors=True)
+                except Exception as e:
+                    logger.warning(f"Failed to remove orphaned directory {orphan}: {e}")
+
+            # Cleanup orphaned git entries
+            for orphan in orphaned_in_git:
+                try:
+                    logger.info(f"Removing orphaned worktree entry: {orphan.name}")
+                    self._run_git('worktree', 'remove', str(orphan), '--force', retry=False)
+                except Exception as e:
+                    logger.warning(f"Failed to remove orphaned worktree {orphan}: {e}")
+
+            # Prune stale entries
+            self._run_git('worktree', 'prune', retry=False)
+
+            if orphaned_on_disk or orphaned_in_git:
+                logger.info(f"Cleaned up {len(orphaned_on_disk) + len(orphaned_in_git)} orphaned worktrees")
+
+        except Exception as e:
+            logger.warning(f"Orphan cleanup failed: {e}")
 
     def _sanitize_branch_name(self, title: str) -> str:
-        """Convert feature title to valid git branch name."""
-        # Remove special chars, replace spaces with dashes, lowercase
-        name = re.sub(r'[^a-zA-Z0-9\s-]', '', title)
-        name = re.sub(r'\s+', '-', name).lower()
-        return f"feature/{name[:50]}"
+        """Convert feature title to valid git branch name, handling special characters.
+
+        Args:
+            title: Raw feature title
+
+        Returns:
+            Sanitized branch name in format: feature/{sanitized-name}
+        """
+        # Remove/replace invalid characters
+        # Valid: alphanumeric, dash, underscore
+        name = re.sub(r'[^\w\s-]', '', title, flags=re.UNICODE)  # Remove special chars
+        name = re.sub(r'[\s_]+', '-', name)  # Replace spaces/underscores with dash
+        name = re.sub(r'-+', '-', name)  # Collapse multiple dashes
+        name = name.strip('-').lower()  # Remove leading/trailing dashes, lowercase
+
+        # Ensure not empty
+        if not name:
+            name = 'feature'
+
+        # Limit length
+        name = name[:50]
+
+        return f"feature/{name}"
+
+    def _resolve_name_collision(self, base_path: Path, max_attempts: int = 100) -> Optional[Path]:
+        """Resolve worktree path collision by appending counter.
+
+        Args:
+            base_path: Base worktree path that collides
+            max_attempts: Maximum number of collision resolution attempts
+
+        Returns:
+            Unique path or None if all attempts exhausted
+        """
+        if not base_path.exists():
+            return base_path
+
+        # Try appending timestamp first
+        timestamp = datetime.now().strftime('%H%M%S')
+        timestamped_path = Path(str(base_path) + f"-{timestamp}")
+        if not timestamped_path.exists():
+            return timestamped_path
+
+        # Fallback to counter
+        for i in range(1, max_attempts):
+            new_path = Path(str(base_path) + f"-{i}")
+            if not new_path.exists():
+                return new_path
+
+        logger.error(f"Cannot resolve name collision after {max_attempts} attempts: {base_path}")
+        return None
+
+    def _fetch_main_branch(self) -> Tuple[bool, str]:
+        """Fetch latest main branch from remote.
+
+        Returns:
+            Tuple of (success, message)
+        """
+        # Check if remote exists
+        success, output = self._run_git('remote', retry=False)
+        if not success or not output.strip():
+            return True, "No remote configured, skipping fetch"
+
+        # Fetch main branch
+        success, output = self._run_git('fetch', 'origin', 'main')
+        if not success:
+            return False, f"Failed to fetch main branch: {output}"
+
+        return True, "Main branch updated"
+
+    def _detect_merge_conflicts(self) -> Tuple[bool, List[str]]:
+        """Detect merge conflicts in current repository.
+
+        Returns:
+            Tuple of (has_conflicts, list of conflicted files)
+        """
+        success, output = self._run_git('diff', '--name-only', '--diff-filter=U', retry=False)
+        if not success:
+            return False, []
+
+        conflicted_files = [f.strip() for f in output.strip().split('\n') if f.strip()]
+        return len(conflicted_files) > 0, conflicted_files
 
     def create_worktree(self, feature_id: int, feature_title: str) -> Optional[Path]:
-        """Create a worktree for a feature task.
+        """Create a worktree for a feature task with validation and collision handling.
 
-        Returns the worktree path or None if failed.
+        Args:
+            feature_id: Unique feature ID
+            feature_title: Feature title (will be sanitized for branch name)
+
+        Returns:
+            The worktree path or None if failed
+
+        Raises:
+            ValidationError: If inputs are invalid
+            DiskSpaceError: If insufficient disk space
+            WorktreeError: If worktree creation fails
         """
-        branch_name = self._sanitize_branch_name(f"{feature_id}-{feature_title}")
-        worktree_path = self.worktrees_path / f"wt-{feature_id}"
+        try:
+            # Input validation
+            if not isinstance(feature_id, int) or feature_id <= 0:
+                raise ValidationError(f"Invalid feature_id: {feature_id}")
+            if not feature_title or not isinstance(feature_title, str):
+                raise ValidationError(f"Invalid feature_title: {feature_title}")
 
-        # Clean up existing worktree if any
-        self.cleanup_worktree(feature_id)
+            # Pre-flight checks
+            self.check_disk_space()
 
-        # Create branch from main
-        success, _ = self._run_git('branch', branch_name, 'main')
-        if not success:
-            # Branch might already exist, try to reset it
-            self._run_git('branch', '-D', branch_name)
+            # Sanitize branch name
+            branch_name = self._sanitize_branch_name(f"{feature_id}-{feature_title}")
+            base_worktree_path = self.worktrees_path / f"wt-{feature_id}"
+
+            # Resolve name collision if exists
+            worktree_path = self._resolve_name_collision(base_worktree_path)
+            if not worktree_path:
+                raise WorktreeError(f"Cannot resolve worktree path collision for feature #{feature_id}")
+
+            # Clean up existing worktree if any
+            if base_worktree_path.exists():
+                self.cleanup_worktree(feature_id)
+
+            # Create branch from main (with retry)
             success, output = self._run_git('branch', branch_name, 'main')
             if not success:
-                logger.error(f"Failed to create branch {branch_name}: {output}")
-                return None
+                # Branch might already exist, try to reset it
+                logger.info(f"Branch {branch_name} exists, recreating...")
+                self._run_git('branch', '-D', branch_name, retry=False)
+                success, output = self._run_git('branch', branch_name, 'main')
+                if not success:
+                    raise WorktreeError(
+                        f"Failed to create branch {branch_name} for feature #{feature_id}: {output}"
+                    )
 
-        # Create worktree
-        success, output = self._run_git('worktree', 'add', str(worktree_path), branch_name)
-        if not success:
-            logger.error(f"Failed to create worktree: {output}")
-            self._run_git('branch', '-D', branch_name)
-            return None
+            # Create worktree (with retry)
+            success, output = self._run_git('worktree', 'add', str(worktree_path), branch_name)
+            if not success:
+                # Cleanup branch on failure
+                self._run_git('branch', '-D', branch_name, retry=False)
+                raise WorktreeError(
+                    f"Failed to create worktree for feature #{feature_id} at {worktree_path}: {output}"
+                )
 
-        logger.info(f"Created worktree for feature #{feature_id}: {worktree_path}")
-        return worktree_path
+            logger.info(f"Created worktree for feature #{feature_id}: {worktree_path.name} (branch: {branch_name})")
+            return worktree_path
 
-    def cleanup_worktree(self, feature_id: int):
-        """Remove a worktree and its branch."""
+        except (ValidationError, DiskSpaceError, WorktreeError) as e:
+            logger.error(f"Worktree creation failed for feature #{feature_id}: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error creating worktree for feature #{feature_id}: {e}")
+            raise WorktreeError(f"Unexpected worktree creation error: {e}")
+
+    def cleanup_worktree(self, feature_id: int) -> None:
+        """Remove a worktree and its branch with enhanced error handling.
+
+        Args:
+            feature_id: Feature ID to cleanup
+
+        Note:
+            This method logs errors but does not raise exceptions to allow
+            cleanup to continue even if some operations fail.
+        """
         worktree_path = self.worktrees_path / f"wt-{feature_id}"
 
-        if worktree_path.exists():
+        if not worktree_path.exists():
+            # Also check for collision-resolved paths (wt-{id}-timestamp or wt-{id}-N)
+            pattern = f"wt-{feature_id}-*"
+            matches = list(self.worktrees_path.glob(pattern))
+            if matches:
+                worktree_path = matches[0]  # Use first match
+            else:
+                logger.debug(f"Worktree path does not exist, skipping cleanup: {worktree_path}")
+                return
+
+        try:
             # Get branch name before removing
-            success, output = self._run_git('worktree', 'list', '--porcelain')
             branch_name = None
+            success, output = self._run_git('worktree', 'list', '--porcelain', retry=False)
             if success:
-                for line in output.split('\n'):
-                    if str(worktree_path) in line or f"wt-{feature_id}" in output:
-                        # Find branch in next lines
-                        pass
+                lines = output.split('\n')
+                for i, line in enumerate(lines):
+                    if str(worktree_path) in line:
+                        # Branch name is in the "branch" line after worktree line
+                        for j in range(i + 1, min(i + 5, len(lines))):
+                            if lines[j].startswith('branch '):
+                                branch_name = lines[j].replace('branch refs/heads/', '').strip()
+                                break
+                        break
 
-            # Remove worktree
-            self._run_git('worktree', 'remove', str(worktree_path), '--force')
+            # Remove worktree from git
+            success, output = self._run_git('worktree', 'remove', str(worktree_path), '--force', retry=False)
+            if not success:
+                logger.warning(f"Git worktree remove failed for {worktree_path.name}: {output}")
 
-            # Also try to remove directory if git didn't
+            # Force remove directory if still exists (locked worktree, etc.)
             if worktree_path.exists():
-                shutil.rmtree(worktree_path, ignore_errors=True)
+                try:
+                    shutil.rmtree(worktree_path, ignore_errors=False)
+                    logger.info(f"Force removed worktree directory: {worktree_path.name}")
+                except PermissionError:
+                    logger.error(f"Permission denied removing locked worktree: {worktree_path.name}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove worktree directory: {e}")
+                    # Last resort: ignore_errors=True
+                    shutil.rmtree(worktree_path, ignore_errors=True)
 
-        # Prune worktrees
-        self._run_git('worktree', 'prune')
+            # Cleanup branch if found
+            if branch_name:
+                success, output = self._run_git('branch', '-D', branch_name, retry=False)
+                if success:
+                    logger.debug(f"Removed branch: {branch_name}")
+                else:
+                    logger.debug(f"Branch cleanup failed (may not exist): {branch_name}")
+
+        except Exception as e:
+            logger.warning(f"Worktree cleanup error for feature #{feature_id}: {e}")
+        finally:
+            # Always prune stale entries
+            try:
+                self._run_git('worktree', 'prune', retry=False)
+            except Exception as e:
+                logger.debug(f"Worktree prune failed: {e}")
 
     def merge_to_main(self, feature_id: int, feature_title: str) -> Tuple[bool, str]:
-        """Merge feature branch to main after tests pass.
+        """Merge feature branch to main after tests pass with enhanced error handling.
 
-        Returns (success, message).
+        Args:
+            feature_id: Feature ID
+            feature_title: Feature title
+
+        Returns:
+            Tuple of (success, message)
+
+        Note:
+            Fetches latest main branch before merge to ensure up-to-date
         """
-        branch_name = self._sanitize_branch_name(f"{feature_id}-{feature_title}")
+        try:
+            branch_name = self._sanitize_branch_name(f"{feature_id}-{feature_title}")
 
-        # Checkout main
-        success, output = self._run_git('checkout', 'main')
-        if not success:
-            return False, f"Failed to checkout main: {output}"
+            # Fetch latest main branch first
+            fetch_success, fetch_msg = self._fetch_main_branch()
+            if not fetch_success:
+                logger.warning(f"Failed to fetch main branch: {fetch_msg}")
+                # Continue anyway - might be offline or no remote
 
-        # Pull latest
-        self._run_git('pull', '--rebase')
+            # Checkout main
+            success, output = self._run_git('checkout', 'main')
+            if not success:
+                raise WorktreeError(f"Failed to checkout main for feature #{feature_id}: {output}")
 
-        # Merge feature branch
-        success, output = self._run_git('merge', branch_name, '--no-edit',
-                                        '-m', f"Merge {branch_name}: {feature_title}")
+            # Pull latest (with rebase to avoid merge commits)
+            success, output = self._run_git('pull', '--rebase', retry=False)
+            if not success:
+                logger.warning(f"Pull rebase failed (may be no remote): {output}")
+                # Continue - local repo or no changes
 
-        if not success:
-            if 'CONFLICT' in output:
-                return False, f"CONFLICT: {output}"
-            return False, f"Merge failed: {output}"
+            # Check if branch exists
+            success, output = self._run_git('rev-parse', '--verify', branch_name, retry=False)
+            if not success:
+                return False, f"Branch {branch_name} does not exist for feature #{feature_id}"
 
-        # Push to remote
-        self._run_git('push')
+            # Merge feature branch
+            commit_msg = f"Merge {branch_name}: {feature_title}\n\nFeature #{feature_id}"
+            success, output = self._run_git('merge', branch_name, '--no-edit', '-m', commit_msg)
 
-        # Cleanup branch
-        self._run_git('branch', '-d', branch_name)
+            if not success:
+                # Check for merge conflicts
+                has_conflicts, conflicted_files = self._detect_merge_conflicts()
+                if has_conflicts:
+                    # Abort merge
+                    self._run_git('merge', '--abort', retry=False)
+                    raise MergeConflictError(
+                        f"Merge conflicts detected for feature #{feature_id} in files: "
+                        f"{', '.join(conflicted_files[:5])}"
+                    )
+                else:
+                    raise WorktreeError(f"Merge failed for feature #{feature_id}: {output}")
 
-        logger.info(f"Merged feature #{feature_id} to main")
-        return True, "Merged successfully"
+            # Push to remote (if configured)
+            success, output = self._run_git('push', retry=False)
+            if not success:
+                logger.warning(f"Push failed (may be no remote configured): {output}")
+                # Don't fail merge if push fails - might be offline
+
+            # Cleanup branch
+            success, output = self._run_git('branch', '-d', branch_name, retry=False)
+            if not success:
+                logger.warning(f"Failed to delete branch {branch_name}: {output}")
+                # Don't fail merge if branch deletion fails
+
+            logger.info(f"Successfully merged feature #{feature_id} to main: {feature_title}")
+            return True, "Merged successfully"
+
+        except MergeConflictError as e:
+            logger.error(str(e))
+            return False, f"MERGE_CONFLICT: {str(e)}"
+        except WorktreeError as e:
+            logger.error(str(e))
+            return False, f"MERGE_FAILED: {str(e)}"
+        except Exception as e:
+            logger.error(f"Unexpected merge error for feature #{feature_id}: {e}")
+            # Try to abort any in-progress merge
+            self._run_git('merge', '--abort', retry=False)
+            return False, f"Unexpected merge error: {e}"
 
     def resolve_conflicts(self, claude_cmd: str, feature_title: str) -> bool:
         """Use Claude to resolve merge conflicts."""
@@ -755,20 +1150,43 @@ class Runner:
                     logger.error(f"Processing failed for {imp['title']}: {e}")
 
     def _process_improvement_in_worktree(self, improvement: Dict):
-        """Process improvement in its own worktree."""
+        """Process improvement in its own worktree with enhanced error handling."""
         imp_id = improvement['id']
         title = improvement['title']
 
-        # Create worktree for this feature
-        worktree_path = self.worktree_mgr.create_worktree(imp_id, title)
+        try:
+            # Validate improvement before processing
+            self.worktree_mgr.validate_improvement(improvement)
 
-        if worktree_path:
-            # Process in worktree
-            self._process_improvement(improvement, work_dir=worktree_path)
-        else:
-            # Fallback to main repo if worktree fails
-            logger.warning(f"Worktree failed for #{imp_id}, using main repo")
-            self._process_improvement(improvement)
+            # Create worktree for this feature
+            worktree_path = self.worktree_mgr.create_worktree(imp_id, title)
+
+            if worktree_path:
+                # Process in worktree
+                self._process_improvement(improvement, work_dir=worktree_path)
+            else:
+                # This shouldn't happen with new error handling, but keep as fallback
+                logger.warning(f"Worktree creation returned None for #{imp_id}, using main repo")
+                self._process_improvement(improvement)
+
+        except ValidationError as e:
+            logger.error(f"Validation failed for feature #{imp_id}: {e}")
+            self.db.mark_failed(imp_id, f"Validation error: {e}")
+        except DiskSpaceError as e:
+            logger.error(f"Insufficient disk space for feature #{imp_id}: {e}")
+            self.db.mark_failed(imp_id, f"Disk space error: {e}")
+        except WorktreeError as e:
+            logger.error(f"Worktree error for feature #{imp_id}: {e}")
+            # Fallback to main repo
+            logger.info(f"Falling back to main repo for feature #{imp_id}")
+            try:
+                self._process_improvement(improvement)
+            except Exception as fallback_error:
+                logger.error(f"Fallback processing also failed: {fallback_error}")
+                self.db.mark_failed(imp_id, f"Worktree and fallback failed: {e}, {fallback_error}")
+        except Exception as e:
+            logger.error(f"Unexpected error processing feature #{imp_id}: {e}")
+            self.db.mark_failed(imp_id, f"Unexpected error: {e}")
 
     def _test_in_worktree(self, improvement: Dict):
         """Test improvement in worktree, merge to main if passes."""
