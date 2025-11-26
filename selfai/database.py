@@ -104,6 +104,16 @@ class Database:
                     except sqlite3.OperationalError:
                         pass
 
+                conn.execute('''
+                CREATE TABLE IF NOT EXISTS unlock_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    level INTEGER NOT NULL,
+                    feature_id INTEGER,
+                    unlocked_at TEXT NOT NULL,
+                    UNIQUE(level)
+                )
+                ''')
+
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_status ON improvements(status)')
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_priority ON improvements(priority)')
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_current_level ON improvements(current_level)')
@@ -295,32 +305,47 @@ class Database:
             return [dict(row) for row in cursor.fetchall()]
 
     def get_stats(self) -> Dict:
-        """Get statistics."""
-        with sqlite3.connect(self.db_path) as conn:
-            stats = {}
-            for status in ['pending', 'in_progress', 'testing', 'completed']:
-                cursor = conn.execute("SELECT COUNT(*) FROM improvements WHERE status = ?", (status,))
-                stats[status] = cursor.fetchone()[0]
-            cursor = conn.execute("SELECT COUNT(*) FROM improvements")
-            stats['total'] = cursor.fetchone()[0]
-            return stats
+        """Get statistics.
+
+        Returns:
+            Dict with counts for each status, never None
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                stats = {}
+                for status in ['pending', 'in_progress', 'testing', 'completed']:
+                    cursor = conn.execute("SELECT COUNT(*) FROM improvements WHERE status = ?", (status,))
+                    stats[status] = cursor.fetchone()[0]
+                cursor = conn.execute("SELECT COUNT(*) FROM improvements")
+                stats['total'] = cursor.fetchone()[0]
+                return stats
+        except Exception as e:
+            logger.error(f"Failed to get stats from database: {e}")
+            return {'pending': 0, 'in_progress': 0, 'testing': 0, 'completed': 0, 'total': 0}
 
     def get_level_stats(self) -> Dict:
-        """Get statistics by current level."""
-        with sqlite3.connect(self.db_path) as conn:
-            stats = {}
-            for level in [1, 2, 3]:
-                cursor = conn.execute(
-                    "SELECT COUNT(*) FROM improvements WHERE current_level = ? AND status != 'completed'",
-                    (level,))
-                stats[level] = {'in_progress': cursor.fetchone()[0]}
+        """Get statistics by current level.
 
-                # Count completed at each level
-                level_col = {1: 'mvp', 2: 'enhanced', 3: 'advanced'}[level]
-                cursor = conn.execute(
-                    f"SELECT COUNT(*) FROM improvements WHERE {level_col}_test_status = 'passed'")
-                stats[level]['passed'] = cursor.fetchone()[0]
-            return stats
+        Returns:
+            Dict with level statistics, never None
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                stats = {}
+                for level in [1, 2, 3]:
+                    cursor = conn.execute(
+                        "SELECT COUNT(*) FROM improvements WHERE current_level = ? AND status != 'completed'",
+                        (level,))
+                    stats[level] = {'in_progress': cursor.fetchone()[0]}
+
+                    level_col = {1: 'mvp', 2: 'enhanced', 3: 'advanced'}[level]
+                    cursor = conn.execute(
+                        f"SELECT COUNT(*) FROM improvements WHERE {level_col}_test_status = 'passed'")
+                    stats[level]['passed'] = cursor.fetchone()[0]
+                return stats
+        except Exception as e:
+            logger.error(f"Failed to get level stats from database: {e}")
+            return {}
 
     def get_average_duration_by_level(self) -> Dict[int, Optional[float]]:
         """Get average duration in seconds for each level from completed tasks."""
@@ -337,34 +362,37 @@ class Database:
     def get_tasks_with_time_estimates(self) -> List[Dict]:
         """Get all tasks with estimated time remaining for in-progress tasks.
 
-        Returns list of tasks with additional 'estimated_remaining' field (in seconds) for active tasks.
+        Returns:
+            List of tasks with 'estimated_remaining' field, never None
         """
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.execute('SELECT * FROM improvements ORDER BY id DESC')
-            tasks = [dict(row) for row in cursor.fetchall()]
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute('SELECT * FROM improvements ORDER BY id DESC')
+                tasks = [dict(row) for row in cursor.fetchall()]
 
-            # Get average durations
-            averages = self.get_average_duration_by_level()
+                averages = self.get_average_duration_by_level()
 
-            # Calculate estimated remaining time for in-progress tasks
-            now = datetime.now()
-            for task in tasks:
-                task['estimated_remaining'] = None
-                if task['status'] in ('in_progress', 'testing') and task['started_at']:
-                    try:
-                        started_at = datetime.fromisoformat(task['started_at'])
-                        elapsed = (now - started_at).total_seconds()
-                        level = task['current_level']
-                        avg_duration = averages.get(level)
+                now = datetime.now()
+                for task in tasks:
+                    task['estimated_remaining'] = None
+                    if task['status'] in ('in_progress', 'testing') and task['started_at']:
+                        try:
+                            started_at = datetime.fromisoformat(task['started_at'])
+                            elapsed = (now - started_at).total_seconds()
+                            level = task['current_level']
+                            avg_duration = averages.get(level)
 
-                        if avg_duration:
-                            remaining = avg_duration - elapsed
-                            task['estimated_remaining'] = max(0, remaining)  # Don't show negative
-                    except (ValueError, AttributeError):
-                        pass
+                            if avg_duration:
+                                remaining = avg_duration - elapsed
+                                task['estimated_remaining'] = max(0, remaining)
+                        except (ValueError, AttributeError):
+                            pass
 
-            return tasks
+                return tasks
+        except Exception as e:
+            logger.error(f"Failed to get tasks with time estimates from database: {e}")
+            return []
 
     def exists(self, title: str) -> bool:
         """Check if improvement with title already exists."""
@@ -412,3 +440,108 @@ class Database:
             cursor = conn.execute(
                 'SELECT * FROM improvements WHERE current_level = ?', (level,))
             return [dict(row) for row in cursor.fetchall()]
+
+    def check_level_unlock(self, level: int) -> bool:
+        """Check if a level is unlocked based on previous level completions.
+
+        Args:
+            level: The level to check (2=Enhanced, 3=Advanced)
+
+        Returns:
+            True if level is unlocked, False otherwise
+
+        Raises:
+            ValueError: If level is invalid (must be 2 or 3)
+        """
+        if level not in (2, 3):
+            raise ValueError(f"Invalid level: {level}. Only Enhanced (2) and Advanced (3) can be locked.")
+
+        thresholds = {2: 5, 3: 10}
+        threshold = thresholds[level]
+        prev_level_col = {2: 'mvp', 3: 'enhanced'}[level]
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute(
+                    f"SELECT COUNT(*) FROM improvements WHERE {prev_level_col}_test_status = 'passed'")
+                count = cursor.fetchone()[0]
+
+                if count is None or count < 0:
+                    logger.warning(f"Invalid count ({count}) when checking level {level} unlock")
+                    return False
+
+                return count >= threshold
+        except sqlite3.Error as e:
+            logger.error(f"Database error checking level {level} unlock: {e}")
+            return False
+
+    def get_unlock_progress(self, level: int) -> tuple[int, int]:
+        """Get progress toward unlocking a level.
+
+        Args:
+            level: The level to check (2=Enhanced, 3=Advanced)
+
+        Returns:
+            Tuple of (current_count, required_count)
+
+        Raises:
+            ValueError: If level is invalid
+        """
+        if level not in (2, 3):
+            raise ValueError(f"Invalid level: {level}. Only Enhanced (2) and Advanced (3) can be locked.")
+
+        thresholds = {2: 5, 3: 10}
+        threshold = thresholds[level]
+        prev_level_col = {2: 'mvp', 3: 'enhanced'}[level]
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute(
+                    f"SELECT COUNT(*) FROM improvements WHERE {prev_level_col}_test_status = 'passed'")
+                count = cursor.fetchone()[0]
+
+                if count is None or count < 0:
+                    logger.warning(f"Invalid count ({count}) for level {level} progress")
+                    return (0, threshold)
+
+                return (count, threshold)
+        except sqlite3.Error as e:
+            logger.error(f"Database error getting level {level} progress: {e}")
+            return (0, threshold)
+
+    def record_unlock_event(self, level: int, feature_id: Optional[int] = None) -> bool:
+        """Record when a level is unlocked.
+
+        Args:
+            level: The level that was unlocked (2=Enhanced, 3=Advanced)
+            feature_id: Optional ID of the feature that triggered the unlock
+
+        Returns:
+            True if event was recorded, False if already recorded or error
+
+        Raises:
+            ValueError: If level is invalid
+        """
+        if level not in (2, 3):
+            raise ValueError(f"Invalid level: {level}. Only Enhanced (2) and Advanced (3) can be locked.")
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute(
+                    'SELECT id FROM unlock_events WHERE level = ?', (level,))
+                if cursor.fetchone():
+                    logger.debug(f"Level {level} unlock already recorded")
+                    return False
+
+                conn.execute(
+                    'INSERT INTO unlock_events (level, feature_id, unlocked_at) VALUES (?, ?, ?)',
+                    (level, feature_id, datetime.now().isoformat()))
+                conn.commit()
+                logger.info(f"Level {level} ({LEVEL_NAMES[level]}) unlocked!")
+                return True
+        except sqlite3.IntegrityError:
+            logger.debug(f"Level {level} unlock already recorded (integrity constraint)")
+            return False
+        except sqlite3.Error as e:
+            logger.error(f"Database error recording level {level} unlock: {e}")
+            return False

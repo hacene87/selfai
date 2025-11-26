@@ -224,6 +224,58 @@ def add_improvement(title: str, description: str = '', category: str = 'general'
     print(f"Added improvement #{imp_id}: {title}")
 
 
+def test_feature(feature_id: int, verbose: bool = False):
+    """Test a specific feature by ID."""
+    repo_path = get_repo_root()
+    runner = Runner(repo_path)
+
+    can_test, reason = runner.db.can_test_feature(feature_id)
+    if not can_test:
+        print(f"Cannot test feature #{feature_id}: {reason}")
+        return
+
+    feature = runner.db.get_by_id(feature_id)
+    if not feature:
+        print(f"Feature #{feature_id} not found")
+        return
+
+    retry_count = feature.get('retry_count', 0)
+    level = feature.get('current_level', 1)
+    level_name = {1: 'MVP', 2: 'Enhanced', 3: 'Advanced'}[level]
+
+    print(f"\nTesting Feature #{feature_id}")
+    print(f"  Title: {feature['title']}")
+    print(f"  Level: {level_name} ({level}/3)")
+    print(f"  Retry: {retry_count}/3")
+    print(f"  Status: {feature['status']}")
+
+    if verbose:
+        print(f"\n  Description: {feature.get('description', 'N/A')}")
+        print(f"  Category: {feature.get('category', 'N/A')}")
+        print(f"  Priority: {feature.get('priority', 'N/A')}")
+
+    print("\nRunning tests...")
+
+    try:
+        runner._run_tests(feature)
+
+        updated = runner.db.get_by_id(feature_id)
+        if updated:
+            level_col = {1: 'mvp', 2: 'enhanced', 3: 'advanced'}[level]
+            test_status = updated.get(f'{level_col}_test_status', 'pending')
+
+            print(f"\nTest Result: {test_status.upper()}")
+
+            if verbose and updated.get(f'{level_col}_test_output'):
+                print(f"\nTest Output:")
+                print(updated.get(f'{level_col}_test_output')[:500])
+        else:
+            print("Error: Could not retrieve updated feature status")
+
+    except Exception as e:
+        print(f"Error running tests: {e}")
+
+
 def print_help():
     """Print usage help."""
     print("""
@@ -240,6 +292,7 @@ Commands:
     dashboard    Open dashboard in browser
     analyze-logs Analyze recent logs for errors and issues
     add          Add a manual improvement
+    test         Test a specific feature by ID
     help         Show this help
 
 Complexity Levels:
@@ -260,6 +313,8 @@ Examples:
     python -m _selfai dashboard                # View in browser
     python -m _selfai analyze-logs             # Check for errors in logs
     python -m _selfai add "Fix bug X"          # Add MVP-level task
+    python -m _selfai test 5                   # Test feature #5
+    python -m _selfai test 5 --verbose         # Test feature #5 with detailed output
     python -m _selfai add "Feature" "" "" 80 2 # Add Enhanced task (priority 80)
     python -m _selfai uninstall                # Stop autonomous runs
 """)
@@ -294,6 +349,16 @@ def main():
         category = sys.argv[4] if len(sys.argv) > 4 else 'general'
         priority = int(sys.argv[5]) if len(sys.argv) > 5 else 50
         add_improvement(title, description, category, priority)
+    elif command == 'test':
+        if len(sys.argv) < 3:
+            print("Usage: python -m _selfai test <feature_id> [--verbose]")
+            return
+        try:
+            feature_id = int(sys.argv[2])
+            verbose = '--verbose' in sys.argv or '-v' in sys.argv
+            test_feature(feature_id, verbose)
+        except ValueError:
+            print("Error: feature_id must be an integer")
     elif command in ('help', '-h', '--help'):
         print_help()
     else:

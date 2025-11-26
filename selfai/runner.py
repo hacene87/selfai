@@ -29,7 +29,7 @@ import re
 import shutil
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .database import Database, LEVEL_NAMES
 
@@ -70,8 +70,8 @@ class WorktreeManager:
         self.worktrees_path = workspace_path / 'worktrees'
         self.worktrees_path.mkdir(parents=True, exist_ok=True)
 
-        # Cleanup orphaned worktrees on startup
-        self._cleanup_orphaned_worktrees()
+        # NOTE: Don't cleanup orphaned worktrees on startup - this causes race conditions
+        # when multiple workers are running. Cleanup is done explicitly after task completion.
 
     def _run_git(self, *args, cwd: Path = None, retry: bool = True) -> Tuple[bool, str]:
         """Run a git command with retry logic and return (success, output)."""
@@ -625,7 +625,17 @@ class LogAnalyzer:
 
         Returns:
             String containing recent log lines, empty string if error
+
+        Raises:
+            ValidationError: If lines parameter is invalid
         """
+        if not isinstance(lines, int):
+            raise ValidationError(f"lines must be an integer, got {type(lines).__name__}")
+        if lines <= 0:
+            raise ValidationError(f"lines must be positive, got {lines}")
+        if lines > 100000:
+            raise ValidationError(f"lines too large (max 100000), got {lines}")
+
         log_file = self.logs_path / 'runner.log'
 
         # Handle missing log file
@@ -647,11 +657,11 @@ class LogAnalyzer:
             content = log_file.read_text(encoding='utf-8', errors='replace')
             log_lines = content.split('\n')
             return '\n'.join(log_lines[-lines:])
-        except PermissionError:
-            logger.error(f"Permission denied reading log file: {log_file}")
+        except PermissionError as e:
+            logger.error(f"Permission denied reading log file: {log_file}. Fix with: chmod 644 {log_file}")
             return ""
         except OSError as e:
-            logger.error(f"Error reading log file: {e}")
+            logger.error(f"Error reading log file: {e}. Check disk space and file system health.")
             return ""
         except Exception as e:
             logger.error(f"Unexpected error reading logs: {e}")
@@ -678,7 +688,32 @@ class LogAnalyzer:
         }
 
     def diagnose_and_fix(self, issue: Dict, repo_path: Path) -> Optional[str]:
-        """Use Claude to diagnose and fix an issue."""
+        """Use Claude to diagnose and fix an issue.
+
+        Args:
+            issue: Dict with 'type' and 'detail' keys
+            repo_path: Path to repository
+
+        Returns:
+            Diagnosis output or None if failed
+
+        Raises:
+            ValidationError: If issue or repo_path is invalid
+        """
+        if not isinstance(issue, dict):
+            raise ValidationError(f"issue must be a dict, got {type(issue).__name__}")
+        if not issue:
+            raise ValidationError("issue dict cannot be empty")
+        if 'type' not in issue or 'detail' not in issue:
+            raise ValidationError(f"issue must have 'type' and 'detail' keys, got {list(issue.keys())}")
+
+        if not isinstance(repo_path, Path):
+            raise ValidationError(f"repo_path must be a Path object, got {type(repo_path).__name__}")
+        if not repo_path.exists():
+            raise ValidationError(f"Repository path does not exist: {repo_path}")
+        if not repo_path.is_dir():
+            raise ValidationError(f"Repository path is not a directory: {repo_path}")
+
         prompt = f'''Analyze this issue from the SelfAI system and suggest a fix.
 
 Issue Type: {issue.get('type')}
@@ -706,12 +741,39 @@ Be concise and actionable.'''
             )
             if result.returncode == 0:
                 return result.stdout
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Diagnosis timed out after 300s for issue: {issue.get('type')}")
+            return None
+        except FileNotFoundError:
+            logger.error(f"Claude CLI not found at: {self.claude_cmd}. Install it or update path.")
+            return None
         except Exception as e:
             logger.warning(f"Diagnosis failed: {e}")
         return None
 
     def think_about_improvements(self, stats: Dict, repo_path: Path) -> List[Dict]:
-        """Analyze performance and suggest self-improvements."""
+        """Analyze performance and suggest self-improvements.
+
+        Args:
+            stats: Dict with performance statistics
+            repo_path: Path to repository
+
+        Returns:
+            List of improvement suggestions
+
+        Raises:
+            ValidationError: If stats or repo_path is invalid
+        """
+        if not isinstance(stats, dict):
+            raise ValidationError(f"stats must be a dict, got {type(stats).__name__}")
+        if stats is None:
+            raise ValidationError("stats cannot be None")
+
+        if not isinstance(repo_path, Path):
+            raise ValidationError(f"repo_path must be a Path object, got {type(repo_path).__name__}")
+        if not repo_path.exists():
+            raise ValidationError(f"Repository path does not exist: {repo_path}")
+
         logs = self.get_recent_logs(500)
         analysis = self.analyze_logs()
 
@@ -762,28 +824,79 @@ OUTPUT FORMAT (JSON):
             logger.warning(f"Self-improvement analysis failed: {e}")
         return []
 
-    def save_issues(self, issues: List[Dict]):
-        """Save issues to file for tracking."""
+    def save_issues(self, issues: List[Dict]) -> None:
+        """Save issues to file for tracking.
+
+        Args:
+            issues: List of issue dicts to save
+
+        Raises:
+            ValidationError: If issues is invalid
+        """
+        if not isinstance(issues, list):
+            raise ValidationError(f"issues must be a list, got {type(issues).__name__}")
+        if issues is None:
+            raise ValidationError("issues cannot be None")
+
         try:
             existing = []
             if self.issues_file.exists():
-                existing = json.loads(self.issues_file.read_text())
-            existing.extend(issues)
-            # Keep last 100 issues
-            self.issues_file.write_text(json.dumps(existing[-100:], indent=2))
-        except Exception:
-            pass
+                try:
+                    content = self.issues_file.read_text()
+                    if content.strip():
+                        existing = json.loads(content)
+                        if not isinstance(existing, list):
+                            logger.warning(f"Existing issues file has invalid format, resetting")
+                            existing = []
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Corrupted issues file, resetting: {e}")
+                    existing = []
 
-    def save_improvements(self, improvements: List[Dict]):
-        """Save self-improvement suggestions."""
+            existing.extend(issues)
+            self.issues_file.write_text(json.dumps(existing[-100:], indent=2))
+        except PermissionError:
+            logger.error(f"Permission denied writing to issues file: {self.issues_file}. Fix with: chmod 644 {self.issues_file}")
+        except OSError as e:
+            logger.error(f"Error writing issues file: {e}. Check disk space.")
+        except Exception as e:
+            logger.error(f"Unexpected error saving issues: {e}")
+
+    def save_improvements(self, improvements: List[Dict]) -> None:
+        """Save self-improvement suggestions.
+
+        Args:
+            improvements: List of improvement dicts to save
+
+        Raises:
+            ValidationError: If improvements is invalid
+        """
+        if not isinstance(improvements, list):
+            raise ValidationError(f"improvements must be a list, got {type(improvements).__name__}")
+        if improvements is None:
+            raise ValidationError("improvements cannot be None")
+
         try:
             existing = []
             if self.improvements_file.exists():
-                existing = json.loads(self.improvements_file.read_text())
+                try:
+                    content = self.improvements_file.read_text()
+                    if content.strip():
+                        existing = json.loads(content)
+                        if not isinstance(existing, list):
+                            logger.warning(f"Existing improvements file has invalid format, resetting")
+                            existing = []
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Corrupted improvements file, resetting: {e}")
+                    existing = []
+
             existing.extend(improvements)
             self.improvements_file.write_text(json.dumps(existing[-50:], indent=2))
-        except Exception:
-            pass
+        except PermissionError:
+            logger.error(f"Permission denied writing to improvements file: {self.improvements_file}. Fix with: chmod 644 {self.improvements_file}")
+        except OSError as e:
+            logger.error(f"Error writing improvements file: {e}. Check disk space.")
+        except Exception as e:
+            logger.error(f"Unexpected error saving improvements: {e}")
 
 
 class Runner:
@@ -1683,12 +1796,13 @@ Remember: Quality over quantity. Only suggest features that truly matter.'''
         duration = time.time() - start_time
 
         if output:
-            self.db.mark_level_completed(imp_id, level, output)
-            logger.info(f"✓ {level_name} completed: {title} ({self._format_duration(duration)})")
-
-            # If using worktree, commit changes
+            # If using worktree, commit changes BEFORE marking completed
+            # This prevents race condition where cleanup happens before commit
             if work_dir:
                 self._commit_worktree_changes(work_dir, imp_id, title, level_name)
+
+            self.db.mark_level_completed(imp_id, level, output)
+            logger.info(f"✓ {level_name} completed: {title} ({self._format_duration(duration)})")
         else:
             self.db.mark_failed(imp_id, "Execution failed")
             logger.error(f"✗ {level_name} failed: {title}")
@@ -1696,6 +1810,11 @@ Remember: Quality over quantity. Only suggest features that truly matter.'''
     def _commit_worktree_changes(self, work_dir: Path, imp_id: int, title: str, level_name: str):
         """Commit changes made in a worktree."""
         try:
+            # Check if worktree still exists
+            if not work_dir.exists():
+                logger.warning(f"Worktree {work_dir} no longer exists, skipping commit for #{imp_id}")
+                return
+
             # Add all changes
             subprocess.run(['git', 'add', '-A'], cwd=str(work_dir), capture_output=True)
 
@@ -1841,39 +1960,97 @@ Execute the plan now.'''
             logger.error(f"Claude execution error: {e}")
             return {'success': False, 'error': str(e)}
 
-    def _format_duration(self, seconds: float) -> str:
-        """Format duration in human readable form."""
-        if seconds < 60:
-            return f"{int(seconds)}s"
-        minutes = int(seconds // 60)
-        secs = int(seconds % 60)
-        return f"{minutes}m {secs}s"
+    def _format_duration(self, seconds: Optional[Union[int, float]]) -> str:
+        """Format duration in human readable form.
 
-    def update_dashboard(self):
-        """Update HTML dashboard with parallel processing info."""
-        stats = self.db.get_stats()
-        level_stats = self.db.get_level_stats()
-        improvements = self.db.get_tasks_with_time_estimates()
+        Args:
+            seconds: Duration in seconds (int or float), can be None
 
-        # Get active worktrees for parallel task tracking
-        active_worktrees = self.worktree_mgr.get_active_worktrees()
+        Returns:
+            Formatted string like "5m 30s" or "–" if invalid
+        """
+        if seconds is None:
+            return "–"
 
-        html_content = self._generate_dashboard_html(improvements, stats, level_stats, active_worktrees)
-        dashboard_path = self.workspace_path / 'dashboard.html'
-        dashboard_path.write_text(html_content)
-        logger.info(f"Dashboard updated: {stats.get('completed', 0)} completed, {stats.get('pending', 0)} pending, {len(active_worktrees)} parallel")
+        try:
+            seconds = float(seconds)
+            if seconds < 0:
+                return "–"
+            if seconds < 60:
+                return f"{int(seconds)}s"
+            minutes = int(seconds // 60)
+            secs = int(seconds % 60)
+            return f"{minutes}m {secs}s"
+        except (TypeError, ValueError) as e:
+            logger.warning(f"Invalid duration value: {seconds}, error: {e}")
+            return "–"
 
-    def _get_level_progress_indicator(self, imp: dict, level: int) -> str:
-        """Generate visual progress indicator for current level (Plan → Execute → Test)."""
+    def update_dashboard(self) -> None:
+        """Update HTML dashboard with parallel processing info.
+
+        Handles errors gracefully and uses fallback values if database queries fail.
+        """
+        try:
+            stats = self.db.get_stats()
+            if stats is None:
+                logger.error("Failed to get stats from database, using empty stats")
+                stats = {'pending': 0, 'testing': 0, 'in_progress': 0, 'completed': 0, 'total': 0}
+
+            level_stats = self.db.get_level_stats()
+            if level_stats is None:
+                logger.warning("Failed to get level stats, using empty dict")
+                level_stats = {}
+
+            improvements = self.db.get_tasks_with_time_estimates()
+            if improvements is None:
+                logger.warning("Failed to get improvements, using empty list")
+                improvements = []
+
+            active_worktrees = self.worktree_mgr.get_active_worktrees()
+            if active_worktrees is None:
+                active_worktrees = []
+
+            html_content = self._generate_dashboard_html(improvements, stats, level_stats, active_worktrees)
+
+            if not html_content or not html_content.strip():
+                logger.error("Generated HTML content is empty, dashboard not updated")
+                return
+
+            dashboard_path = self.workspace_path / 'dashboard.html'
+            dashboard_path.write_text(html_content)
+            logger.info(f"Dashboard updated: {stats.get('completed', 0)} completed, {stats.get('pending', 0)} pending, {len(active_worktrees)} parallel")
+
+        except Exception as e:
+            logger.error(f"Failed to update dashboard: {e}. Check database connection and worktree manager.", exc_info=True)
+
+    def _get_level_progress_indicator(self, imp: Optional[Dict], level: Optional[int]) -> str:
+        """Generate visual progress indicator for current level (Plan → Execute → Test).
+
+        Args:
+            imp: Improvement dictionary with level-specific data
+            level: Current level (1=MVP, 2=Enhanced, 3=Advanced)
+
+        Returns:
+            HTML string with progress indicator or fallback if invalid input
+        """
+        if imp is None or not isinstance(imp, dict):
+            logger.warning("Invalid improvement dict in _get_level_progress_indicator")
+            return '<span class="level-progress">○ → ○ → ○</span>'
+
+        if level not in [1, 2, 3]:
+            logger.warning(f"Invalid level {level} in _get_level_progress_indicator, defaulting to 1")
+            level = 1
+
         level_prefix = {1: 'mvp', 2: 'enhanced', 3: 'advanced'}.get(level, 'mvp')
 
-        # Check what's completed at this level
         has_plan = imp.get(f'{level_prefix}_plan') is not None
         has_output = imp.get(f'{level_prefix}_output') is not None
         test_status = imp.get(f'{level_prefix}_test_status', 'pending')
 
-        # Build progress indicator based on workflow stage
-        # ○ = pending, ● = completed/in-progress, ✓ = passed, ✗ = failed
+        if test_status not in ['pending', 'passed', 'failed']:
+            logger.warning(f"Unknown test_status '{test_status}', defaulting to pending")
+            test_status = 'pending'
+
         plan_icon = '●' if has_plan else '○'
         exec_icon = '●' if has_output else '○'
 
@@ -1886,71 +2063,105 @@ Execute the plan now.'''
 
         return f'<span class="level-progress">{plan_icon} → {exec_icon} → {test_icon}</span>'
 
-    def _generate_dashboard_html(self, improvements: list, stats: dict, level_stats: dict,
-                                   active_worktrees: List[Path] = None) -> str:
-        """Generate dashboard HTML with parallel task tracking."""
-        active_worktrees = active_worktrees or []
+    def _generate_dashboard_html(self, improvements: Optional[List[Dict]], stats: Optional[Dict],
+                                   level_stats: Optional[Dict], active_worktrees: Optional[List[Path]] = None) -> str:
+        """Generate dashboard HTML with parallel task tracking.
 
-        # Get IDs of active parallel tasks
+        Args:
+            improvements: List of improvement dicts from database
+            stats: Overall statistics dict
+            level_stats: Statistics by level dict
+            active_worktrees: List of active worktree paths
+
+        Returns:
+            Complete HTML string for dashboard
+        """
+        if improvements is None or not isinstance(improvements, list):
+            logger.warning("Invalid improvements list, using empty list")
+            improvements = []
+
+        if stats is None or not isinstance(stats, dict):
+            logger.warning("Invalid stats dict, using defaults")
+            stats = {'pending': 0, 'testing': 0, 'in_progress': 0, 'completed': 0, 'total': 0}
+
+        if level_stats is None:
+            level_stats = {}
+
+        if active_worktrees is None or not isinstance(active_worktrees, list):
+            active_worktrees = []
+
         active_ids = set()
         for wt in active_worktrees:
             try:
-                # Extract ID from worktree name (wt-{id})
+                if wt is None or not hasattr(wt, 'name'):
+                    continue
                 wt_id = int(wt.name.replace('wt-', ''))
                 active_ids.add(wt_id)
-            except (ValueError, AttributeError):
-                pass
+            except (ValueError, AttributeError, TypeError) as e:
+                logger.debug(f"Could not extract ID from worktree {wt}: {e}")
+                continue
 
         rows = []
         for imp in improvements:
-            status = imp['status']
-            level = imp['current_level']
-            level_name = LEVEL_NAMES.get(level, 'MVP')
+            try:
+                if imp is None or not isinstance(imp, dict):
+                    logger.warning(f"Skipping invalid improvement entry: {imp}")
+                    continue
 
-            # Test status indicator - show which levels are tested
-            mvp_test = imp.get('mvp_test_status', 'pending')
-            enh_test = imp.get('enhanced_test_status', 'pending')
-            adv_test = imp.get('advanced_test_status', 'pending')
+                imp_id = imp.get('id', '?')
+                title = imp.get('title', 'Unknown Feature')
+                status = imp.get('status', 'pending')
+                level = imp.get('current_level', 1)
+                priority = imp.get('priority', 50)
 
-            # Build progress indicator
-            mvp_icon = '✓' if mvp_test == 'passed' else ('✗' if mvp_test == 'failed' else '○')
-            enh_icon = '✓' if enh_test == 'passed' else ('✗' if enh_test == 'failed' else '–')
-            adv_icon = '✓' if adv_test == 'passed' else ('✗' if adv_test == 'failed' else '–')
-            progress = f"{mvp_icon} | {enh_icon} | {adv_icon}"
+                if level not in [1, 2, 3]:
+                    logger.warning(f"Invalid level {level} for improvement {imp_id}, defaulting to 1")
+                    level = 1
 
-            # Completed level display
-            completed_level = "–"
-            if adv_test == 'passed':
-                completed_level = "Advanced"
-            elif enh_test == 'passed':
-                completed_level = "Enhanced"
-            elif mvp_test == 'passed':
-                completed_level = "MVP"
+                level_name = LEVEL_NAMES.get(level, 'MVP')
 
-            # Current level progress indicator (Plan → Execute → Test)
-            level_progress = self._get_level_progress_indicator(imp, level)
+                mvp_test = imp.get('mvp_test_status', 'pending')
+                enh_test = imp.get('enhanced_test_status', 'pending')
+                adv_test = imp.get('advanced_test_status', 'pending')
 
-            # Check if running in parallel worktree
-            is_parallel = imp['id'] in active_ids
-            parallel_indicator = '⚡' if is_parallel else ''
+                mvp_icon = '✓' if mvp_test == 'passed' else ('✗' if mvp_test == 'failed' else '○')
+                enh_icon = '✓' if enh_test == 'passed' else ('✗' if enh_test == 'failed' else '–')
+                adv_icon = '✓' if adv_test == 'passed' else ('✗' if adv_test == 'failed' else '–')
+                progress = f"{mvp_icon} | {enh_icon} | {adv_icon}"
 
-            # Estimated time remaining
-            time_estimate = "–"
-            if imp.get('estimated_remaining') is not None:
-                time_estimate = self._format_duration(imp['estimated_remaining'])
+                completed_level = "–"
+                if adv_test == 'passed':
+                    completed_level = "Advanced"
+                elif enh_test == 'passed':
+                    completed_level = "Enhanced"
+                elif mvp_test == 'passed':
+                    completed_level = "MVP"
 
-            status_class = status.replace('_', '-')
-            rows.append(f'''
+                level_progress = self._get_level_progress_indicator(imp, level)
+
+                is_parallel = imp_id in active_ids
+                parallel_indicator = '⚡' if is_parallel else ''
+
+                time_estimate = "–"
+                if imp.get('estimated_remaining') is not None:
+                    time_estimate = self._format_duration(imp['estimated_remaining'])
+
+                status_class = status.replace('_', '-')
+                rows.append(f'''
             <tr class="{status_class}{' parallel' if is_parallel else ''}">
-                <td>{imp['id']}</td>
-                <td>{parallel_indicator} {html.escape(imp['title'])}</td>
+                <td>{imp_id}</td>
+                <td>{parallel_indicator} {html.escape(title)}</td>
                 <td><span class="level-badge level-{level}">{level_name}</span> {level_progress}</td>
                 <td class="progress-cell">{progress}</td>
                 <td>{completed_level}</td>
                 <td><span class="status-badge {status_class}">{status}</span></td>
                 <td>{time_estimate}</td>
-                <td>{imp['priority']}</td>
+                <td>{priority}</td>
             </tr>''')
+
+            except Exception as e:
+                logger.warning(f"Error generating row for improvement {imp.get('id', '?')}: {e}")
+                continue
 
         return f'''<!DOCTYPE html>
 <html lang="en">
