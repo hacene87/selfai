@@ -533,6 +533,9 @@ class Runner:
                 logger.info("All existing features tested - discovering new improvements...")
                 self._run_discovery()
 
+                # Phase 5: Self-improvement thinking (after discovery)
+                self._think_about_self_improvement(stats)
+
             # Log analysis AFTER completing tasks
             post_analysis = self.log_analyzer.analyze_logs()
             if post_analysis['issues_found'] > pre_analysis['issues_found']:
@@ -576,6 +579,41 @@ class Runner:
                     logger.info(f"Could not auto-fix issue: {issue.get('detail', '')[:50]}")
             except Exception as e:
                 logger.warning(f"Self-diagnosis failed: {e}")
+
+    def _think_about_self_improvement(self, stats: Dict):
+        """Analyze performance and suggest improvements to the system itself.
+
+        Uses Claude to analyze patterns and suggest enhancements that would
+        make the SelfAI system more effective.
+        """
+        # Only run occasionally - every 5 completed features
+        completed = stats.get('completed', 0)
+        if completed == 0 or completed % 5 != 0:
+            return
+
+        logger.info("Self-improvement: Analyzing system performance...")
+
+        try:
+            improvements = self.log_analyzer.think_about_improvements(stats, self.repo_path)
+
+            if improvements:
+                logger.info(f"Self-improvement: Generated {len(improvements)} suggestions")
+                self.log_analyzer.save_improvements(improvements)
+
+                # Add improvements to the database as new features to implement
+                for imp in improvements[:2]:  # Only add top 2 suggestions per cycle
+                    title = f"[Self-Improvement] {imp.get('title', 'Unknown')}"
+                    if not self.db.exists(title):
+                        self.db.add(
+                            title=title,
+                            description=imp.get('description', ''),
+                            category='self-improvement',
+                            priority=imp.get('priority', 60),
+                            source='self_analysis'
+                        )
+                        logger.info(f"Added self-improvement: {title}")
+        except Exception as e:
+            logger.warning(f"Self-improvement thinking failed: {e}")
 
     def _get_batch_needs_testing(self, max_count: int) -> List[Dict]:
         """Get batch of improvements that need testing (unique only)."""
