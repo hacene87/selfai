@@ -7,10 +7,12 @@ Each feature progresses through:
 
 At each level: Plan → Execute → Test → (Pass: Next Level, Fail: Retry)
 
-PARALLEL PROCESSING:
-- Multiple tasks can be processed concurrently
-- Batch testing for faster validation
-- Continuous processing until timeout
+PARALLEL PROCESSING WITH GIT WORKTREES:
+- Each task runs in its own git worktree (isolated branch)
+- Main branch stays clean
+- Successful tests merge to main automatically
+- Conflicts resolved with Claude assistance
+- Up to 5 parallel tasks supported
 """
 import os
 import subprocess
@@ -18,30 +20,201 @@ import logging
 import json
 import html
 import time
+import re
+import shutil
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .database import Database, LEVEL_NAMES
 
 logger = logging.getLogger('selfai')
 
 
+class WorktreeManager:
+    """Manage git worktrees for parallel task execution."""
+
+    def __init__(self, repo_path: Path, workspace_path: Path):
+        self.repo_path = repo_path
+        self.worktrees_path = workspace_path / 'worktrees'
+        self.worktrees_path.mkdir(parents=True, exist_ok=True)
+
+    def _run_git(self, *args, cwd: Path = None) -> Tuple[bool, str]:
+        """Run a git command and return (success, output)."""
+        try:
+            result = subprocess.run(
+                ['git'] + list(args),
+                capture_output=True, text=True, timeout=60,
+                cwd=str(cwd or self.repo_path)
+            )
+            return result.returncode == 0, result.stdout + result.stderr
+        except Exception as e:
+            return False, str(e)
+
+    def _sanitize_branch_name(self, title: str) -> str:
+        """Convert feature title to valid git branch name."""
+        # Remove special chars, replace spaces with dashes, lowercase
+        name = re.sub(r'[^a-zA-Z0-9\s-]', '', title)
+        name = re.sub(r'\s+', '-', name).lower()
+        return f"feature/{name[:50]}"
+
+    def create_worktree(self, feature_id: int, feature_title: str) -> Optional[Path]:
+        """Create a worktree for a feature task.
+
+        Returns the worktree path or None if failed.
+        """
+        branch_name = self._sanitize_branch_name(f"{feature_id}-{feature_title}")
+        worktree_path = self.worktrees_path / f"wt-{feature_id}"
+
+        # Clean up existing worktree if any
+        self.cleanup_worktree(feature_id)
+
+        # Create branch from main
+        success, _ = self._run_git('branch', branch_name, 'main')
+        if not success:
+            # Branch might already exist, try to reset it
+            self._run_git('branch', '-D', branch_name)
+            success, output = self._run_git('branch', branch_name, 'main')
+            if not success:
+                logger.error(f"Failed to create branch {branch_name}: {output}")
+                return None
+
+        # Create worktree
+        success, output = self._run_git('worktree', 'add', str(worktree_path), branch_name)
+        if not success:
+            logger.error(f"Failed to create worktree: {output}")
+            self._run_git('branch', '-D', branch_name)
+            return None
+
+        logger.info(f"Created worktree for feature #{feature_id}: {worktree_path}")
+        return worktree_path
+
+    def cleanup_worktree(self, feature_id: int):
+        """Remove a worktree and its branch."""
+        worktree_path = self.worktrees_path / f"wt-{feature_id}"
+
+        if worktree_path.exists():
+            # Get branch name before removing
+            success, output = self._run_git('worktree', 'list', '--porcelain')
+            branch_name = None
+            if success:
+                for line in output.split('\n'):
+                    if str(worktree_path) in line or f"wt-{feature_id}" in output:
+                        # Find branch in next lines
+                        pass
+
+            # Remove worktree
+            self._run_git('worktree', 'remove', str(worktree_path), '--force')
+
+            # Also try to remove directory if git didn't
+            if worktree_path.exists():
+                shutil.rmtree(worktree_path, ignore_errors=True)
+
+        # Prune worktrees
+        self._run_git('worktree', 'prune')
+
+    def merge_to_main(self, feature_id: int, feature_title: str) -> Tuple[bool, str]:
+        """Merge feature branch to main after tests pass.
+
+        Returns (success, message).
+        """
+        branch_name = self._sanitize_branch_name(f"{feature_id}-{feature_title}")
+
+        # Checkout main
+        success, output = self._run_git('checkout', 'main')
+        if not success:
+            return False, f"Failed to checkout main: {output}"
+
+        # Pull latest
+        self._run_git('pull', '--rebase')
+
+        # Merge feature branch
+        success, output = self._run_git('merge', branch_name, '--no-edit',
+                                        '-m', f"Merge {branch_name}: {feature_title}")
+
+        if not success:
+            if 'CONFLICT' in output:
+                return False, f"CONFLICT: {output}"
+            return False, f"Merge failed: {output}"
+
+        # Push to remote
+        self._run_git('push')
+
+        # Cleanup branch
+        self._run_git('branch', '-d', branch_name)
+
+        logger.info(f"Merged feature #{feature_id} to main")
+        return True, "Merged successfully"
+
+    def resolve_conflicts(self, claude_cmd: str, feature_title: str) -> bool:
+        """Use Claude to resolve merge conflicts."""
+        # Get conflicted files
+        success, output = self._run_git('diff', '--name-only', '--diff-filter=U')
+        if not success or not output.strip():
+            return False
+
+        conflicted_files = output.strip().split('\n')
+        logger.info(f"Resolving conflicts in: {conflicted_files}")
+
+        for file_path in conflicted_files:
+            prompt = f'''Resolve the git merge conflict in this file.
+
+File: {file_path}
+Feature being merged: {feature_title}
+
+Read the file, understand both versions, and create a merged version that:
+1. Keeps all functionality from both versions
+2. Resolves any logical conflicts intelligently
+3. Maintains code quality
+
+After resolving, the file should have NO conflict markers (<<<, ===, >>>).'''
+
+            try:
+                subprocess.run(
+                    [claude_cmd, '-p', prompt, '--allowedTools', 'Read', 'Edit', 'Write'],
+                    capture_output=True, timeout=300, cwd=str(self.repo_path)
+                )
+                # Stage resolved file
+                self._run_git('add', file_path)
+            except Exception as e:
+                logger.error(f"Failed to resolve conflict in {file_path}: {e}")
+                return False
+
+        # Complete the merge
+        success, _ = self._run_git('commit', '--no-edit')
+        return success
+
+    def get_active_worktrees(self) -> List[Path]:
+        """List all active worktrees."""
+        success, output = self._run_git('worktree', 'list', '--porcelain')
+        if not success:
+            return []
+
+        worktrees = []
+        for line in output.split('\n'):
+            if line.startswith('worktree ') and 'wt-' in line:
+                path = Path(line.replace('worktree ', ''))
+                if path.exists():
+                    worktrees.append(path)
+        return worktrees
+
+
 class Runner:
     """Autonomous self-improving runner with 3-level feature progression.
 
     Features:
-    - Parallel task processing with configurable workers
-    - Batch testing for faster validation
-    - Continuous processing mode
-    - Smart model selection (haiku for simple, sonnet for complex)
+    - Parallel task processing with git worktrees (isolated branches)
+    - Each feature developed in its own branch
+    - Automatic merge to main after tests pass
+    - Conflict resolution with Claude assistance
+    - Up to 5 parallel tasks supported
     """
 
     CLAUDE_CMD = 'claude'
     LOCK_FILE = 'selfai.lock'
 
     # Parallel processing config
-    MAX_WORKERS = 3  # Max concurrent tasks
+    MAX_WORKERS = 5  # Max concurrent tasks (using worktrees)
     MAX_TASKS_PER_RUN = 5  # Max tasks to process in one run
     RUN_TIMEOUT = 600  # Max seconds per run cycle (10 min)
 
@@ -82,7 +255,9 @@ class Runner:
         self.logs_path.mkdir(parents=True, exist_ok=True)
 
         self.db = Database(self.data_path / 'improvements.db')
+        self.worktree_mgr = WorktreeManager(repo_path, self.workspace_path)
         self._setup_logging()
+        self._ensure_git_repo()
 
     def _setup_logging(self):
         """Setup file logging."""
@@ -90,6 +265,27 @@ class Runner:
         handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s'))
         logger.addHandler(handler)
         logger.setLevel(logging.INFO)
+
+    def _ensure_git_repo(self):
+        """Ensure the repository is a git repo with main branch."""
+        git_dir = self.repo_path / '.git'
+        if not git_dir.exists():
+            logger.warning("Not a git repository - worktrees disabled")
+            return
+
+        # Ensure we're on main branch
+        result = subprocess.run(
+            ['git', 'branch', '--show-current'],
+            capture_output=True, text=True, cwd=str(self.repo_path)
+        )
+        current_branch = result.stdout.strip()
+
+        if current_branch != 'main':
+            # Try to checkout or create main
+            subprocess.run(
+                ['git', 'checkout', '-B', 'main'],
+                capture_output=True, cwd=str(self.repo_path)
+            )
 
     def acquire_lock(self) -> bool:
         """Acquire process lock."""
@@ -114,15 +310,16 @@ class Runner:
         return self.db.get_stats()
 
     def run_once(self):
-        """Run improvement cycle with continuous processing.
+        """Run improvement cycle with parallel worktrees.
 
-        Processes multiple tasks in one run for efficiency:
+        Each task runs in its own git worktree (isolated branch):
         1. If no features exist, analyze existing codebase first
-        2. Batch test all features waiting for testing (parallel)
-        3. Process multiple pending improvements (parallel where safe)
-        4. Only discover NEW features after all existing are complete
+        2. Batch test features in parallel worktrees
+        3. Process pending improvements in parallel worktrees
+        4. Merge successful features to main
+        5. Discover NEW features after all existing are complete
 
-        Continues until MAX_TASKS_PER_RUN reached or RUN_TIMEOUT exceeded.
+        Up to 5 parallel tasks using git worktrees.
         """
         if not self.acquire_lock():
             return
@@ -143,32 +340,22 @@ class Runner:
             improvement = self.db.get_next_in_progress()
             if improvement:
                 logger.info(f"Resuming: {improvement['title']} (Level {improvement['current_level']})")
-                self._process_improvement(improvement)
+                self._process_improvement_in_worktree(improvement)
                 tasks_processed += 1
 
-            # Phase 2: Batch test all features waiting for testing (PARALLEL)
-            testing_batch = self._get_all_needs_testing()
+            # Phase 2: Batch test features in PARALLEL WORKTREES
+            testing_batch = self._get_batch_needs_testing(self.MAX_WORKERS)
             if testing_batch:
-                logger.info(f"Batch testing {len(testing_batch)} features in parallel...")
-                self._run_batch_tests(testing_batch)
+                logger.info(f"Batch testing {len(testing_batch)} features in parallel worktrees...")
+                self._run_parallel_tests(testing_batch)
                 tasks_processed += len(testing_batch)
 
-            # Phase 3: Process pending improvements (continuous until limit)
-            while tasks_processed < self.MAX_TASKS_PER_RUN:
-                # Check timeout
-                if time.time() - start_time > self.RUN_TIMEOUT:
-                    logger.info(f"Run timeout reached after {tasks_processed} tasks")
-                    break
-
-                improvement = self.db.get_next_pending()
-                if not improvement:
-                    break
-
-                self._process_improvement(improvement)
-                tasks_processed += 1
-
-                # Check if feature needs testing immediately
-                self.db.get_next_needs_testing()
+            # Phase 3: Process pending improvements in PARALLEL WORKTREES
+            pending_batch = self._get_batch_pending(self.MAX_WORKERS - tasks_processed)
+            if pending_batch:
+                logger.info(f"Processing {len(pending_batch)} features in parallel worktrees...")
+                self._run_parallel_improvements(pending_batch)
+                tasks_processed += len(pending_batch)
 
             # Phase 4: Only discover NEW features after all existing are complete
             stats = self.db.get_stats()
@@ -176,34 +363,54 @@ class Runner:
                 logger.info("All existing features tested - discovering new improvements...")
                 self._run_discovery()
 
-            logger.info(f"Run completed: {tasks_processed} tasks processed in {self._format_duration(time.time() - start_time)}")
+            logger.info(f"Run completed: {tasks_processed} tasks in {self._format_duration(time.time() - start_time)}")
 
         finally:
             self.release_lock()
             self.update_dashboard()
             self._check_self_deploy()
 
-    def _get_all_needs_testing(self) -> List[Dict]:
-        """Get all improvements that need testing."""
+    def _get_batch_needs_testing(self, max_count: int) -> List[Dict]:
+        """Get batch of improvements that need testing (unique only)."""
         results = []
-        while True:
+        seen_ids = set()
+        for _ in range(max_count * 2):  # Check more to find unique
             imp = self.db.get_next_needs_testing()
             if not imp:
                 break
-            # Temporarily mark to avoid re-selecting
-            results.append(imp)
-            if len(results) >= self.MAX_WORKERS * 2:
+            if imp['id'] not in seen_ids:
+                seen_ids.add(imp['id'])
+                results.append(imp)
+            if len(results) >= max_count:
                 break
         return results
 
-    def _run_batch_tests(self, improvements: List[Dict]):
-        """Run tests for multiple improvements in parallel."""
+    def _get_batch_pending(self, max_count: int) -> List[Dict]:
+        """Get batch of pending improvements."""
+        if max_count <= 0:
+            return []
+        results = []
+        seen_ids = set()
+        for _ in range(max_count * 2):
+            imp = self.db.get_next_pending()
+            if not imp:
+                break
+            if imp['id'] not in seen_ids:
+                seen_ids.add(imp['id'])
+                results.append(imp)
+                self.db.mark_in_progress(imp['id'])  # Mark to avoid re-selection
+            if len(results) >= max_count:
+                break
+        return results
+
+    def _run_parallel_tests(self, improvements: List[Dict]):
+        """Run tests for multiple improvements in parallel worktrees."""
         if not improvements:
             return
 
         with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as executor:
             futures = {
-                executor.submit(self._run_tests, imp): imp
+                executor.submit(self._test_in_worktree, imp): imp
                 for imp in improvements
             }
 
@@ -213,6 +420,69 @@ class Runner:
                     future.result()
                 except Exception as e:
                     logger.error(f"Test failed for {imp['title']}: {e}")
+
+    def _run_parallel_improvements(self, improvements: List[Dict]):
+        """Process multiple improvements in parallel worktrees."""
+        if not improvements:
+            return
+
+        with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(self._process_improvement_in_worktree, imp): imp
+                for imp in improvements
+            }
+
+            for future in as_completed(futures):
+                imp = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Processing failed for {imp['title']}: {e}")
+
+    def _process_improvement_in_worktree(self, improvement: Dict):
+        """Process improvement in its own worktree."""
+        imp_id = improvement['id']
+        title = improvement['title']
+
+        # Create worktree for this feature
+        worktree_path = self.worktree_mgr.create_worktree(imp_id, title)
+
+        if worktree_path:
+            # Process in worktree
+            self._process_improvement(improvement, work_dir=worktree_path)
+        else:
+            # Fallback to main repo if worktree fails
+            logger.warning(f"Worktree failed for #{imp_id}, using main repo")
+            self._process_improvement(improvement)
+
+    def _test_in_worktree(self, improvement: Dict):
+        """Test improvement in worktree, merge to main if passes."""
+        imp_id = improvement['id']
+        title = improvement['title']
+        level = improvement['current_level']
+
+        # Run tests (in main repo for testing)
+        self._run_tests(improvement)
+
+        # Check if test passed
+        updated = self.db.get_by_id(imp_id) if hasattr(self.db, 'get_by_id') else None
+        test_status = improvement.get(f'{LEVEL_NAMES[level].lower()}_test_status', 'pending')
+
+        if test_status == 'passed' or (updated and updated.get('status') == 'completed'):
+            # Try to merge to main
+            success, msg = self.worktree_mgr.merge_to_main(imp_id, title)
+            if success:
+                logger.info(f"✓ Merged feature #{imp_id} to main: {title}")
+            elif 'CONFLICT' in msg:
+                # Try to resolve conflicts
+                logger.warning(f"Conflicts in #{imp_id}, attempting resolution...")
+                if self.worktree_mgr.resolve_conflicts(self.CLAUDE_CMD, title):
+                    logger.info(f"✓ Resolved conflicts and merged #{imp_id}")
+                else:
+                    logger.error(f"✗ Could not resolve conflicts for #{imp_id}")
+
+        # Cleanup worktree
+        self.worktree_mgr.cleanup_worktree(imp_id)
 
     def _run_tests(self, improvement: Dict):
         """Run tests for current level of improvement."""
@@ -489,42 +759,71 @@ OUTPUT FORMAT:
             logger.error(f"Failed to parse discoveries: {e}")
             self._parse_features_fallback(output, source='ai_discovered')
 
-    def _process_improvement(self, improvement: Dict):
-        """Process improvement at its current level."""
+    def _process_improvement(self, improvement: Dict, work_dir: Path = None):
+        """Process improvement at its current level.
+
+        Args:
+            improvement: The improvement dict from database
+            work_dir: Optional working directory (worktree path)
+        """
         imp_id = improvement['id']
         title = improvement['title']
         level = improvement['current_level']
         level_name = LEVEL_NAMES[level]
         start_time = time.time()
 
-        logger.info(f"Processing {level_name}: {title}")
+        # Use worktree path if provided, else main repo
+        exec_path = work_dir or self.repo_path
+
+        logger.info(f"Processing {level_name}: {title} (in {exec_path.name})")
         self.db.mark_in_progress(imp_id)
         self.update_dashboard()
 
         # Get or create plan for this level
         plan = self.db.get_plan(imp_id, level)
         if not plan:
-            plan = self._create_plan(improvement, level)
+            plan = self._create_plan(improvement, level, exec_path)
             if not plan:
                 self.db.mark_failed(imp_id, "Planning failed")
                 return
             self.db.save_plan(imp_id, level, plan)
 
-        # Execute the plan
-        output = self._execute_plan(improvement, level, plan)
+        # Execute the plan in the specified directory
+        output = self._execute_plan(improvement, level, plan, exec_path)
         duration = time.time() - start_time
 
         if output:
             self.db.mark_level_completed(imp_id, level, output)
             logger.info(f"✓ {level_name} completed: {title} ({self._format_duration(duration)})")
+
+            # If using worktree, commit changes
+            if work_dir:
+                self._commit_worktree_changes(work_dir, imp_id, title, level_name)
         else:
             self.db.mark_failed(imp_id, "Execution failed")
             logger.error(f"✗ {level_name} failed: {title}")
 
-    def _create_plan(self, improvement: Dict, level: int) -> Optional[str]:
+    def _commit_worktree_changes(self, work_dir: Path, imp_id: int, title: str, level_name: str):
+        """Commit changes made in a worktree."""
+        try:
+            # Add all changes
+            subprocess.run(['git', 'add', '-A'], cwd=str(work_dir), capture_output=True)
+
+            # Commit
+            commit_msg = f"[SelfAI] {level_name}: {title}\n\nFeature #{imp_id}"
+            subprocess.run(
+                ['git', 'commit', '-m', commit_msg],
+                cwd=str(work_dir), capture_output=True
+            )
+            logger.info(f"Committed changes for #{imp_id} in worktree")
+        except Exception as e:
+            logger.warning(f"Failed to commit worktree changes: {e}")
+
+    def _create_plan(self, improvement: Dict, level: int, work_dir: Path = None) -> Optional[str]:
         """Create execution plan for specific level."""
         title = improvement['title']
         level_name = LEVEL_NAMES[level]
+        exec_path = work_dir or self.repo_path
 
         # Get previous level's output for context
         prev_context = ""
@@ -536,7 +835,7 @@ OUTPUT FORMAT:
 
         prompt = f'''Create a {level_name} implementation plan.
 
-Repository: {self.repo_path}
+Repository: {exec_path}
 Feature: {title}
 Description: {improvement.get('description', '')}
 Level: {level_name} ({level}/3)
@@ -566,14 +865,15 @@ OUTPUT FORMAT:
         logger.error(f"Planning failed for: {title}")
         return None
 
-    def _execute_plan(self, improvement: Dict, level: int, plan: str) -> Optional[str]:
+    def _execute_plan(self, improvement: Dict, level: int, plan: str, work_dir: Path = None) -> Optional[str]:
         """Execute the plan for specific level."""
         title = improvement['title']
         level_name = LEVEL_NAMES[level]
+        exec_path = work_dir or self.repo_path
 
         prompt = f'''Execute this {level_name} plan.
 
-Repository: {self.repo_path}
+Repository: {exec_path}
 Feature: {title}
 Level: {level_name} ({level}/3)
 
@@ -588,18 +888,19 @@ INSTRUCTIONS:
 
 Execute now.'''
 
-        result = self._execute_claude(prompt, timeout=900)
+        result = self._execute_claude(prompt, timeout=900, work_dir=exec_path)
         if result['success']:
             return result.get('output', '')
         return None
 
-    def _execute_claude(self, prompt: str, timeout: int = 300) -> Dict:
-        """Execute Claude CLI command."""
+    def _execute_claude(self, prompt: str, timeout: int = 300, work_dir: Path = None) -> Dict:
+        """Execute Claude CLI command in specified directory."""
+        exec_path = work_dir or self.repo_path
         try:
             result = subprocess.run(
                 [self.CLAUDE_CMD, '-p', prompt, '--allowedTools',
                  'Edit', 'Write', 'Bash', 'Glob', 'Grep', 'Read'],
-                capture_output=True, text=True, timeout=timeout, cwd=str(self.repo_path)
+                capture_output=True, text=True, timeout=timeout, cwd=str(exec_path)
             )
             return {'success': result.returncode == 0, 'output': result.stdout, 'error': result.stderr}
         except subprocess.TimeoutExpired:
@@ -619,18 +920,34 @@ Execute now.'''
         return f"{minutes}m {secs}s"
 
     def update_dashboard(self):
-        """Update HTML dashboard."""
+        """Update HTML dashboard with parallel processing info."""
         stats = self.db.get_stats()
         level_stats = self.db.get_level_stats()
         improvements = self.db.get_all()
 
-        html_content = self._generate_dashboard_html(improvements, stats, level_stats)
+        # Get active worktrees for parallel task tracking
+        active_worktrees = self.worktree_mgr.get_active_worktrees()
+
+        html_content = self._generate_dashboard_html(improvements, stats, level_stats, active_worktrees)
         dashboard_path = self.workspace_path / 'dashboard.html'
         dashboard_path.write_text(html_content)
-        logger.info(f"Dashboard updated: {stats.get('completed', 0)} completed, {stats.get('pending', 0)} pending")
+        logger.info(f"Dashboard updated: {stats.get('completed', 0)} completed, {stats.get('pending', 0)} pending, {len(active_worktrees)} parallel")
 
-    def _generate_dashboard_html(self, improvements: list, stats: dict, level_stats: dict) -> str:
-        """Generate dashboard HTML."""
+    def _generate_dashboard_html(self, improvements: list, stats: dict, level_stats: dict,
+                                   active_worktrees: List[Path] = None) -> str:
+        """Generate dashboard HTML with parallel task tracking."""
+        active_worktrees = active_worktrees or []
+
+        # Get IDs of active parallel tasks
+        active_ids = set()
+        for wt in active_worktrees:
+            try:
+                # Extract ID from worktree name (wt-{id})
+                wt_id = int(wt.name.replace('wt-', ''))
+                active_ids.add(wt_id)
+            except (ValueError, AttributeError):
+                pass
+
         rows = []
         for imp in improvements:
             status = imp['status']
@@ -657,11 +974,15 @@ Execute now.'''
             elif mvp_test == 'passed':
                 completed_level = "MVP"
 
+            # Check if running in parallel worktree
+            is_parallel = imp['id'] in active_ids
+            parallel_indicator = '⚡' if is_parallel else ''
+
             status_class = status.replace('_', '-')
             rows.append(f'''
-            <tr class="{status_class}">
+            <tr class="{status_class}{' parallel' if is_parallel else ''}">
                 <td>{imp['id']}</td>
-                <td>{html.escape(imp['title'])}</td>
+                <td>{parallel_indicator} {html.escape(imp['title'])}</td>
                 <td><span class="level-badge level-{level}">{level_name}</span></td>
                 <td class="progress-cell">{progress}</td>
                 <td>{completed_level}</td>
@@ -713,6 +1034,7 @@ Execute now.'''
         .stat-card.pending .value {{ color: #eab308; }}
         .stat-card.testing .value {{ color: #3b82f6; }}
         .stat-card.completed .value {{ color: #22c55e; }}
+        .stat-card.parallel .value {{ color: #a855f7; }}
         table {{
             width: 100%;
             border-collapse: collapse;
@@ -748,12 +1070,14 @@ Execute now.'''
         .level-badge.level-3 {{ background: rgba(168,85,247,0.2); color: #a855f7; }}
         .progress-cell {{ font-family: monospace; letter-spacing: 2px; }}
         tr.completed {{ opacity: 0.7; }}
+        tr.parallel {{ background: rgba(168,85,247,0.1); animation: pulse 2s infinite; }}
+        @keyframes pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.7; }} }}
     </style>
 </head>
 <body>
     <div class="container">
         <h1>SelfAI</h1>
-        <p class="subtitle">3-Level Progressive Improvement System</p>
+        <p class="subtitle">Parallel Git Worktrees | 3-Level Progressive Testing | Auto-Merge to Main</p>
 
         <div class="stats">
             <div class="stat-card pending">
@@ -767,6 +1091,10 @@ Execute now.'''
             <div class="stat-card completed">
                 <div class="value">{stats.get('completed', 0)}</div>
                 <div class="label">Completed</div>
+            </div>
+            <div class="stat-card parallel">
+                <div class="value">{len(active_worktrees)}</div>
+                <div class="label">Parallel Workers</div>
             </div>
         </div>
 
