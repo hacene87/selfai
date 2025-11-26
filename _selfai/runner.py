@@ -825,62 +825,76 @@ OUTPUT FORMAT:
         return pass_count > fail_count
 
     def _discover_existing_features(self):
-        """Analyze codebase and catalog all EXISTING features that need testing."""
-        logger.info("Analyzing existing codebase for implemented features...")
+        """Analyze codebase and catalog HIGH-LEVEL features (not functions)."""
+        logger.info("Analyzing existing codebase for high-level features...")
 
-        prompt = f'''Analyze this repository and list ALL existing implemented features.
+        prompt = f'''Analyze this repository and identify HIGH-LEVEL FEATURES only.
 
 Repository: {self.repo_path}
 
-YOUR TASK:
-1. Read through all files in the repository
-2. Identify every distinct feature, function, or capability that is ALREADY implemented
-3. List each as a separate feature that needs to be tested
+CRITICAL RULES:
+1. List only HIGH-LEVEL FEATURES, NOT individual functions or methods
+2. A feature is a complete user-facing capability or major component
+3. Group related functionality into ONE feature (e.g., "Database Management" not "add_record", "delete_record", etc.)
+4. Each feature should represent a significant, testable capability
+5. Be selective - group related functions into single features
 
-IMPORTANT:
-- Only list features that ALREADY EXIST in the code
-- Do NOT suggest new features to add
-- Be thorough - find ALL existing functionality
-- Each feature will go through MVP → Enhanced → Advanced testing
+DO NOT LIST:
+- Individual functions (like "mark_test_passed", "get_next_pending")
+- Helper utilities (like "format_duration", "extract_json")
+- Constants or configuration values
+- Internal implementation details
+
+GOOD EXAMPLES:
+- "Autonomous Improvement Runner" (the main run cycle that orchestrates everything)
+- "HTML Dashboard Generation" (creates visual progress tracking)
+- "macOS LaunchAgent Integration" (scheduled background execution)
+- "Git Worktree Parallel Processing" (isolated branch execution)
+
+BAD EXAMPLES (too granular):
+- "Mark Test Passed Function"
+- "Get Next Pending Improvement"
+- "Format Duration Helper"
 
 OUTPUT FORMAT:
 ```json
 {{
   "existing_features": [
     {{
-      "title": "Feature name (5-10 words)",
-      "description": "What this feature does, which files implement it, key functions/classes",
-      "category": "feature|testing|security|performance|utility",
+      "title": "High-level feature name",
+      "description": "What this feature does as a whole, main files involved",
+      "category": "core|cli|integration|monitoring",
       "priority": 1-100
     }}
   ]
 }}
 ```
 
-Example features to look for:
-- Database operations
-- CLI commands
-- Core functionality
-- Helper utilities
-- Configuration handling
-- Logging systems
-- etc.'''
+Remember: Focus on HIGH-LEVEL capabilities, NOT individual functions.'''
 
         result = self._execute_claude(prompt, timeout=600)
         if result['success']:
             self._parse_existing_features(result['output'])
 
     def _parse_existing_features(self, output: str):
-        """Parse and add existing features to database."""
+        """Parse and add existing features to database (filters out function-level items)."""
         try:
             json_str = self._extract_json(output)
             if json_str:
                 data = json.loads(json_str)
                 features = data.get('existing_features', [])
                 added = 0
+                # Words that indicate this is a function, not a feature
+                skip_words = ['function', 'method', 'helper', 'utility', 'get_', 'set_', 'mark_',
+                              'parse_', 'extract_', 'format_', '_to_', 'is_', 'has_']
                 for feat in features:
                     title = feat.get('title', '')
-                    if title and not self.db.exists(title):
+                    # Skip if too granular (likely a function name)
+                    if not title or len(title) < 10:
+                        continue
+                    if any(skip in title.lower() for skip in skip_words):
+                        continue
+                    if not self.db.exists(title):
                         self.db.add(
                             title=title,
                             description=feat.get('description', ''),
@@ -888,9 +902,9 @@ Example features to look for:
                             priority=feat.get('priority', 50),
                             source='existing'
                         )
-                        logger.info(f"Found existing feature: {title}")
+                        logger.info(f"Found feature: {title}")
                         added += 1
-                logger.info(f"Added {added} existing features to database")
+                logger.info(f"Added {added} high-level features to database")
         except (json.JSONDecodeError, KeyError) as e:
             logger.error(f"Failed to parse existing features: {e}")
             # Try to extract features with regex as fallback
@@ -924,30 +938,36 @@ Example features to look for:
         return None
 
     def _parse_features_fallback(self, output: str, source: str = 'ai_discovered'):
-        """Fallback parser using regex when JSON fails."""
+        """Fallback parser using regex when JSON fails (filters out function-level items)."""
         import re
-        # Look for patterns like "title": "..." or **Feature:**
+        # Words that indicate this is a function, not a feature
+        skip_words = ['function', 'method', 'helper', 'utility', 'get_', 'set_', 'mark_',
+                      'parse_', 'extract_', 'format_', '_to_', 'is_', 'has_']
+
+        # Look for patterns like "title": "..."
         title_patterns = [
             r'"title":\s*"([^"]+)"',
-            r'\*\*([^*]+)\*\*',
-            r'^\d+\.\s+(.+?)(?:\n|$)',
         ]
         found = set()
         for pattern in title_patterns:
             matches = re.findall(pattern, output, re.MULTILINE)
             for title in matches:
                 title = title.strip()
-                if len(title) > 5 and len(title) < 100 and title not in found:
-                    if not self.db.exists(title):
-                        self.db.add(
-                            title=title,
-                            description='Auto-discovered feature',
-                            category='feature',
-                            priority=50,
-                            source=source
-                        )
-                        found.add(title)
-                        logger.info(f"Fallback: Found feature: {title}")
+                # Skip if too short, too long, or looks like a function
+                if len(title) < 15 or len(title) > 80:
+                    continue
+                if any(skip in title.lower() for skip in skip_words):
+                    continue
+                if title not in found and not self.db.exists(title):
+                    self.db.add(
+                        title=title,
+                        description='Auto-discovered feature',
+                        category='feature',
+                        priority=50,
+                        source=source
+                    )
+                    found.add(title)
+                    logger.info(f"Fallback: Found feature: {title}")
         if found:
             logger.info(f"Fallback parser added {len(found)} features")
 
