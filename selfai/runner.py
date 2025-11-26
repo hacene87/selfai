@@ -930,26 +930,31 @@ class Runner:
                 self._discover_existing_features()
                 return
 
-            # Phase 1: Resume any stuck in_progress tasks first
-            improvement = self.db.get_next_in_progress()
-            if improvement:
-                logger.info(f"Resuming: {improvement['title']} (Level {improvement['current_level']})")
-                self._process_improvement_in_worktree(improvement)
-                tasks_processed += 1
+            # Phase 1: Resume ALL stuck in_progress tasks first (PRIORITY)
+            in_progress_batch = self._get_all_in_progress()
+            if in_progress_batch:
+                logger.info(f"Resuming {len(in_progress_batch)} stuck in_progress tasks (priority)...")
+                self._run_parallel_improvements(in_progress_batch[:self.MAX_WORKERS])
+                tasks_processed += len(in_progress_batch[:self.MAX_WORKERS])
 
-            # Phase 2: Batch test features in PARALLEL WORKTREES
-            testing_batch = self._get_batch_needs_testing(self.MAX_WORKERS)
-            if testing_batch:
-                logger.info(f"Batch testing {len(testing_batch)} features in parallel worktrees...")
-                self._run_parallel_tests(testing_batch)
-                tasks_processed += len(testing_batch)
+            # Phase 2: Batch test features in PARALLEL WORKTREES (only if capacity remains)
+            remaining_capacity = self.MAX_WORKERS - tasks_processed
+            if remaining_capacity > 0:
+                testing_batch = self._get_batch_needs_testing(remaining_capacity)
+                if testing_batch:
+                    logger.info(f"Batch testing {len(testing_batch)} features in parallel worktrees...")
+                    self._run_parallel_tests(testing_batch)
+                    tasks_processed += len(testing_batch)
 
-            # Phase 3: Process pending improvements in PARALLEL WORKTREES
-            pending_batch = self._get_batch_pending(self.MAX_WORKERS - tasks_processed)
-            if pending_batch:
-                logger.info(f"Processing {len(pending_batch)} features in parallel worktrees...")
-                self._run_parallel_improvements(pending_batch)
-                tasks_processed += len(pending_batch)
+            # Phase 3: Process pending improvements ONLY IF no in_progress tasks remain
+            if not in_progress_batch:
+                remaining_capacity = self.MAX_WORKERS - tasks_processed
+                if remaining_capacity > 0:
+                    pending_batch = self._get_batch_pending(remaining_capacity)
+                    if pending_batch:
+                        logger.info(f"Processing {len(pending_batch)} features in parallel worktrees...")
+                        self._run_parallel_improvements(pending_batch)
+                        tasks_processed += len(pending_batch)
 
             # Phase 4: Check if current level is complete and progress to next
             stats = self.db.get_stats()
@@ -1093,6 +1098,23 @@ class Runner:
                 results.append(imp)
             if len(results) >= max_count:
                 break
+        return results
+
+    def _get_all_in_progress(self) -> List[Dict]:
+        """Get ALL stuck in-progress tasks for resumption.
+
+        Returns all tasks currently marked as in_progress, which need to be
+        completed before starting new pending tasks.
+        """
+        results = []
+        seen_ids = set()
+        while True:
+            imp = self.db.get_next_in_progress()
+            if not imp:
+                break
+            if imp['id'] not in seen_ids:
+                seen_ids.add(imp['id'])
+                results.append(imp)
         return results
 
     def _get_batch_pending(self, max_count: int) -> List[Dict]:
