@@ -235,11 +235,11 @@ class Database:
             return True
 
     def mark_failed(self, imp_id: int, error: str) -> bool:
-        """Mark improvement as failed (back to pending for retry)."""
+        """Mark improvement as failed."""
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('''
                 UPDATE improvements
-                SET status = 'pending', error = ?, retry_count = retry_count + 1
+                SET status = 'failed', error = ?, retry_count = retry_count + 1
                 WHERE id = ?
             ''', (error, imp_id))
             conn.commit()
