@@ -188,6 +188,57 @@ def add_improvement(title: str, description: str = '', category: str = 'general'
     print(f"Added improvement #{imp_id}: {title}")
 
 
+def test_feature(feature_id: int):
+    """Run tests for a specific feature by ID."""
+    repo_path = get_repo_root()
+    runner = Runner(repo_path)
+
+    # Get the feature
+    improvement = runner.db.get_by_id(feature_id)
+    if not improvement:
+        print(f"Error: Feature #{feature_id} not found")
+        return False
+
+    title = improvement['title']
+    level = improvement['current_level']
+    level_name = {1: 'MVP', 2: 'Enhanced', 3: 'Advanced'}[level]
+    status = improvement['status']
+
+    print(f"\n=== Testing Feature #{feature_id} ===")
+    print(f"Title: {title}")
+    print(f"Level: {level_name} ({level}/3)")
+    print(f"Status: {status}")
+    print(f"\nTest Criteria for {level_name}:")
+    print(runner._get_test_criteria(level))
+    print("\nRunning tests...")
+
+    # Run the tests
+    runner._run_tests(improvement)
+
+    # Get updated status
+    updated = runner.db.get_by_id(feature_id)
+    level_col = level_name.lower()
+    test_status = updated.get(f'{level_col}_test_status', 'unknown')
+    test_output = updated.get(f'{level_col}_test_output', '')
+
+    print(f"\n=== Test Results ===")
+    print(f"Status: {test_status.upper()}")
+
+    if test_status == 'passed':
+        print(f"Feature #{feature_id} passed {level_name} tests!")
+        print(f"New status: {updated['status']}")
+    else:
+        print(f"Feature #{feature_id} failed {level_name} tests")
+        print(f"Retry count: {updated['retry_count']}")
+
+    if test_output:
+        print(f"\nTest Output (truncated):")
+        print(test_output[:500] + '...' if len(test_output) > 500 else test_output)
+
+    runner.update_dashboard()
+    return test_status == 'passed'
+
+
 def print_help():
     """Print usage help."""
     print("""
@@ -200,6 +251,7 @@ Commands:
     install     Install LaunchAgent (runs every 5 minutes)
     uninstall   Remove LaunchAgent
     run         Run a single improvement cycle (includes testing)
+    test <id>   Run tests for a specific feature by ID
     status      Show current status with complexity & test stats
     dashboard   Open dashboard in browser
     add         Add a manual improvement
@@ -219,6 +271,7 @@ Run Cycle:
 Examples:
     python -m _selfai install                  # Start autonomous improvements
     python -m _selfai run                      # Run once manually
+    python -m _selfai test 5                   # Test feature #5 manually
     python -m _selfai status                   # Check progress & test status
     python -m _selfai dashboard                # View in browser
     python -m _selfai add "Fix bug X"          # Add MVP-level task
@@ -241,6 +294,16 @@ def main():
         uninstall_launchagent()
     elif command == 'run':
         run_once()
+    elif command == 'test':
+        if len(sys.argv) < 3:
+            print("Usage: python -m _selfai test <feature_id>")
+            return
+        try:
+            feature_id = int(sys.argv[2])
+        except ValueError:
+            print("Error: Feature ID must be an integer")
+            return
+        test_feature(feature_id)
     elif command == 'status':
         show_status()
     elif command == 'dashboard':
