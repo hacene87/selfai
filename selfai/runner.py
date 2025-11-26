@@ -1736,7 +1736,7 @@ Execute now.'''
         """Update HTML dashboard with parallel processing info."""
         stats = self.db.get_stats()
         level_stats = self.db.get_level_stats()
-        improvements = self.db.get_all()
+        improvements = self.db.get_tasks_with_time_estimates()
 
         # Get active worktrees for parallel task tracking
         active_worktrees = self.worktree_mgr.get_active_worktrees()
@@ -1817,6 +1817,11 @@ Execute now.'''
             is_parallel = imp['id'] in active_ids
             parallel_indicator = '⚡' if is_parallel else ''
 
+            # Estimated time remaining
+            time_estimate = "–"
+            if imp.get('estimated_remaining') is not None:
+                time_estimate = self._format_duration(imp['estimated_remaining'])
+
             status_class = status.replace('_', '-')
             rows.append(f'''
             <tr class="{status_class}{' parallel' if is_parallel else ''}">
@@ -1826,6 +1831,7 @@ Execute now.'''
                 <td class="progress-cell">{progress}</td>
                 <td>{completed_level}</td>
                 <td><span class="status-badge {status_class}">{status}</span></td>
+                <td>{time_estimate}</td>
                 <td>{imp['priority']}</td>
             </tr>''')
 
@@ -1953,11 +1959,12 @@ Execute now.'''
                     <th>Tests (M|E|A)</th>
                     <th>Completed At</th>
                     <th>Status</th>
+                    <th>Est. Time Remaining</th>
                     <th>Priority</th>
                 </tr>
             </thead>
             <tbody>
-                {''.join(rows) if rows else '<tr><td colspan="7" style="text-align:center;color:#888;">No improvements yet</td></tr>'}
+                {''.join(rows) if rows else '<tr><td colspan="8" style="text-align:center;color:#888;">No improvements yet</td></tr>'}
             </tbody>
         </table>
     </div>
