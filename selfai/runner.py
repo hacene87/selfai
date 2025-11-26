@@ -1267,18 +1267,19 @@ Execute now.'''
         """Update HTML dashboard with parallel processing info."""
         stats = self.db.get_stats()
         level_stats = self.db.get_level_stats()
+        success_fail_stats = self.db.get_success_fail_stats()
         improvements = self.db.get_all()
 
         # Get active worktrees for parallel task tracking
         active_worktrees = self.worktree_mgr.get_active_worktrees()
 
-        html_content = self._generate_dashboard_html(improvements, stats, level_stats, active_worktrees)
+        html_content = self._generate_dashboard_html(improvements, stats, level_stats, success_fail_stats, active_worktrees)
         dashboard_path = self.workspace_path / 'dashboard.html'
         dashboard_path.write_text(html_content)
         logger.info(f"Dashboard updated: {stats.get('completed', 0)} completed, {stats.get('pending', 0)} pending, {len(active_worktrees)} parallel")
 
     def _generate_dashboard_html(self, improvements: list, stats: dict, level_stats: dict,
-                                   active_worktrees: List[Path] = None) -> str:
+                                   success_fail_stats: dict, active_worktrees: List[Path] = None) -> str:
         """Generate dashboard HTML with parallel task tracking."""
         active_worktrees = active_worktrees or []
 
@@ -1379,6 +1380,11 @@ Execute now.'''
         .stat-card.testing .value {{ color: #3b82f6; }}
         .stat-card.completed .value {{ color: #22c55e; }}
         .stat-card.parallel .value {{ color: #a855f7; }}
+        .stat-card.success .value {{ color: #22c55e; }}
+        .stat-card.failure .value {{ color: #ef4444; }}
+        .stat-card.success-rate .value {{ color: #00d4ff; }}
+        .stat-card.retries .value {{ color: #f97316; }}
+        .stat-card.avg-retries .value {{ color: #f97316; }}
         table {{
             width: 100%;
             border-collapse: collapse;
@@ -1439,6 +1445,29 @@ Execute now.'''
             <div class="stat-card parallel">
                 <div class="value">{len(active_worktrees)}</div>
                 <div class="label">Parallel Workers</div>
+            </div>
+        </div>
+
+        <div class="stats">
+            <div class="stat-card success">
+                <div class="value">{success_fail_stats.get('total_passed', 0)}</div>
+                <div class="label">Tests Passed</div>
+            </div>
+            <div class="stat-card failure">
+                <div class="value">{success_fail_stats.get('total_failed', 0)}</div>
+                <div class="label">Tests Failed</div>
+            </div>
+            <div class="stat-card success-rate">
+                <div class="value">{success_fail_stats.get('success_rate', 0)}%</div>
+                <div class="label">Success Rate</div>
+            </div>
+            <div class="stat-card retries">
+                <div class="value">{success_fail_stats.get('total_retries', 0)}</div>
+                <div class="label">Total Retries</div>
+            </div>
+            <div class="stat-card avg-retries">
+                <div class="value">{success_fail_stats.get('avg_retries', 0)}</div>
+                <div class="label">Avg Retries/Feature</div>
             </div>
         </div>
 

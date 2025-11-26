@@ -317,6 +317,58 @@ class Database:
             row = cursor.fetchone()
             return dict(row) if row else None
 
+    def get_success_fail_stats(self) -> Dict:
+        """Get success/fail statistics and retry metrics.
+
+        Returns:
+            Dict with:
+            - total_passed: Total tests passed across all levels
+            - total_failed: Total tests failed across all levels
+            - success_rate: Percentage of passed tests (0-100)
+            - total_retries: Sum of all retry counts
+            - avg_retries: Average retries per feature
+            - mvp_passed: Count of MVP tests passed
+            - mvp_failed: Count of MVP tests failed
+            - enhanced_passed: Count of Enhanced tests passed
+            - enhanced_failed: Count of Enhanced tests failed
+            - advanced_passed: Count of Advanced tests passed
+            - advanced_failed: Count of Advanced tests failed
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            stats = {}
+
+            # Count passed/failed tests for each level
+            for level, level_col in [(1, 'mvp'), (2, 'enhanced'), (3, 'advanced')]:
+                cursor = conn.execute(
+                    f"SELECT COUNT(*) FROM improvements WHERE {level_col}_test_status = 'passed'")
+                stats[f'{level_col}_passed'] = cursor.fetchone()[0]
+
+                cursor = conn.execute(
+                    f"SELECT COUNT(*) FROM improvements WHERE {level_col}_test_status = 'failed'")
+                stats[f'{level_col}_failed'] = cursor.fetchone()[0]
+
+            # Total passed/failed across all levels
+            stats['total_passed'] = (stats['mvp_passed'] + stats['enhanced_passed'] +
+                                    stats['advanced_passed'])
+            stats['total_failed'] = (stats['mvp_failed'] + stats['enhanced_failed'] +
+                                    stats['advanced_failed'])
+
+            # Success rate
+            total_tests = stats['total_passed'] + stats['total_failed']
+            if total_tests > 0:
+                stats['success_rate'] = round((stats['total_passed'] / total_tests) * 100, 1)
+            else:
+                stats['success_rate'] = 0.0
+
+            # Retry metrics
+            cursor = conn.execute("SELECT SUM(retry_count), COUNT(*) FROM improvements")
+            row = cursor.fetchone()
+            stats['total_retries'] = row[0] if row[0] else 0
+            feature_count = row[1] if row[1] else 0
+            stats['avg_retries'] = round(stats['total_retries'] / feature_count, 1) if feature_count > 0 else 0.0
+
+            return stats
+
     def progress_all_to_level(self, next_level: int) -> int:
         """Progress all completed features to the next level.
 
