@@ -158,6 +158,42 @@ def open_dashboard():
     print(f"Opened dashboard: {dashboard_path}")
 
 
+def analyze_logs():
+    """Analyze recent logs and display issues found."""
+    repo_path = get_repo_root()
+    runner = Runner(repo_path)
+
+    print("\n=== Log Analysis ===")
+    print(f"Repository: {repo_path}")
+
+    # Run analysis
+    analysis = runner.log_analyzer.analyze_logs()
+
+    print(f"\nLog Summary:")
+    print(f"  Lines analyzed: {analysis.get('log_lines', 0)}")
+    print(f"  Issues found:   {analysis.get('issues_found', 0)}")
+
+    # Display issues
+    issues = analysis.get('issues', [])
+    if issues:
+        print(f"\nRecent Issues:")
+        for i, issue in enumerate(issues, 1):
+            issue_type = issue.get('type', 'unknown').upper()
+            detail = issue.get('detail', 'No details')[:80]
+            timestamp = issue.get('timestamp', '')[:19]
+            print(f"  {i}. [{issue_type}] {detail}")
+            print(f"     Time: {timestamp}")
+    else:
+        print("\n  No issues detected in recent logs.")
+
+    # Show log file location
+    log_file = runner.log_analyzer.logs_path / 'runner.log'
+    if log_file.exists():
+        print(f"\nLog file: {log_file}")
+
+    print()
+
+
 def run_once():
     """Run a single improvement cycle."""
     repo_path = get_repo_root()
@@ -197,13 +233,14 @@ Usage:
     python -m _selfai <command> [options]
 
 Commands:
-    install     Install LaunchAgent (runs every 5 minutes)
-    uninstall   Remove LaunchAgent
-    run         Run a single improvement cycle (includes testing)
-    status      Show current status with complexity & test stats
-    dashboard   Open dashboard in browser
-    add         Add a manual improvement
-    help        Show this help
+    install      Install LaunchAgent (runs every 5 minutes)
+    uninstall    Remove LaunchAgent
+    run          Run a single improvement cycle (includes testing)
+    status       Show current status with complexity & test stats
+    dashboard    Open dashboard in browser
+    analyze-logs Analyze recent logs for errors and issues
+    add          Add a manual improvement
+    help         Show this help
 
 Complexity Levels:
     1 = MVP       (Simple, working implementations)
@@ -221,6 +258,7 @@ Examples:
     python -m _selfai run                      # Run once manually
     python -m _selfai status                   # Check progress & test status
     python -m _selfai dashboard                # View in browser
+    python -m _selfai analyze-logs             # Check for errors in logs
     python -m _selfai add "Fix bug X"          # Add MVP-level task
     python -m _selfai add "Feature" "" "" 80 2 # Add Enhanced task (priority 80)
     python -m _selfai uninstall                # Stop autonomous runs
@@ -245,6 +283,8 @@ def main():
         show_status()
     elif command == 'dashboard':
         open_dashboard()
+    elif command == 'analyze-logs':
+        analyze_logs()
     elif command == 'add':
         if len(sys.argv) < 3:
             print("Usage: python -m _selfai add \"title\" [description] [category] [priority]")

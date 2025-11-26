@@ -223,14 +223,43 @@ class LogAnalyzer:
         self.improvements_file = logs_path / 'self_improvements.json'
 
     def get_recent_logs(self, lines: int = 100) -> str:
-        """Get recent log entries."""
+        """Get recent log entries.
+
+        Args:
+            lines: Number of recent lines to retrieve (default: 100)
+
+        Returns:
+            String containing recent log lines, empty string if error
+        """
         log_file = self.logs_path / 'runner.log'
+
+        # Handle missing log file
         if not log_file.exists():
+            logger.debug(f"Log file not found: {log_file}")
             return ""
+
+        # Handle empty log file
         try:
-            content = log_file.read_text()
-            return '\n'.join(content.split('\n')[-lines:])
-        except Exception:
+            if log_file.stat().st_size == 0:
+                logger.debug(f"Log file is empty: {log_file}")
+                return ""
+        except OSError as e:
+            logger.warning(f"Cannot stat log file: {e}")
+            return ""
+
+        # Read log content with error handling
+        try:
+            content = log_file.read_text(encoding='utf-8', errors='replace')
+            log_lines = content.split('\n')
+            return '\n'.join(log_lines[-lines:])
+        except PermissionError:
+            logger.error(f"Permission denied reading log file: {log_file}")
+            return ""
+        except OSError as e:
+            logger.error(f"Error reading log file: {e}")
+            return ""
+        except Exception as e:
+            logger.error(f"Unexpected error reading logs: {e}")
             return ""
 
     def analyze_logs(self) -> Dict:
