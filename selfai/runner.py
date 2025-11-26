@@ -406,7 +406,7 @@ class Runner:
     LOCK_FILE = 'selfai.lock'
 
     # Parallel processing config
-    MAX_WORKERS = 3  # Max concurrent tasks (using worktrees)
+    MAX_WORKERS = 5  # Max concurrent tasks (using worktrees)
     MAX_TASKS_PER_RUN = 5  # Max tasks to process in one run
     RUN_TIMEOUT = 600  # Max seconds per run cycle (10 min)
 
