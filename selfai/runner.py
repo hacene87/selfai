@@ -223,14 +223,43 @@ class LogAnalyzer:
         self.improvements_file = logs_path / 'self_improvements.json'
 
     def get_recent_logs(self, lines: int = 100) -> str:
-        """Get recent log entries."""
+        """Get recent log entries.
+
+        Args:
+            lines: Number of recent lines to retrieve (default: 100)
+
+        Returns:
+            String containing recent log lines, empty string if error
+        """
         log_file = self.logs_path / 'runner.log'
+
+        # Handle missing log file
         if not log_file.exists():
+            logger.debug(f"Log file not found: {log_file}")
             return ""
+
+        # Handle empty log file
         try:
-            content = log_file.read_text()
-            return '\n'.join(content.split('\n')[-lines:])
-        except Exception:
+            if log_file.stat().st_size == 0:
+                logger.debug(f"Log file is empty: {log_file}")
+                return ""
+        except OSError as e:
+            logger.warning(f"Cannot stat log file: {e}")
+            return ""
+
+        # Read log content with error handling
+        try:
+            content = log_file.read_text(encoding='utf-8', errors='replace')
+            log_lines = content.split('\n')
+            return '\n'.join(log_lines[-lines:])
+        except PermissionError:
+            logger.error(f"Permission denied reading log file: {log_file}")
+            return ""
+        except OSError as e:
+            logger.error(f"Error reading log file: {e}")
+            return ""
+        except Exception as e:
+            logger.error(f"Unexpected error reading logs: {e}")
             return ""
 
     def analyze_logs(self) -> Dict:
@@ -823,7 +852,7 @@ OUTPUT FORMAT:
 
 Remember: Your goal is to make this feature WORK, not just test it!'''
 
-        result = self._execute_claude(test_prompt, timeout=3600)  # 1 hour timeout
+        result = self._execute_claude(test_prompt, timeout=300)
 
         if result['success']:
             output = result.get('output', '')
@@ -1228,12 +1257,12 @@ INSTRUCTIONS:
 
 Execute now.'''
 
-        result = self._execute_claude(prompt, timeout=3600, work_dir=exec_path)  # 1 hour timeout
+        result = self._execute_claude(prompt, timeout=900, work_dir=exec_path)
         if result['success']:
             return result.get('output', '')
         return None
 
-    def _execute_claude(self, prompt: str, timeout: int = 3600, work_dir: Path = None) -> Dict:
+    def _execute_claude(self, prompt: str, timeout: int = 300, work_dir: Path = None) -> Dict:
         """Execute Claude CLI command in specified directory."""
         exec_path = work_dir or self.repo_path
         try:
@@ -1263,6 +1292,20 @@ Execute now.'''
         secs = int(seconds % 60)
         return f"{minutes}m {secs}s"
 
+    def update_dashboard(self):
+        """Update HTML dashboard with parallel processing info."""
+        stats = self.db.get_stats()
+        level_stats = self.db.get_level_stats()
+        improvements = self.db.get_all()
+
+        # Get active worktrees for parallel task tracking
+        active_worktrees = self.worktree_mgr.get_active_worktrees()
+
+        html_content = self._generate_dashboard_html(improvements, stats, level_stats, active_worktrees)
+        dashboard_path = self.workspace_path / 'dashboard.html'
+        dashboard_path.write_text(html_content)
+        logger.info(f"Dashboard updated: {stats.get('completed', 0)} completed, {stats.get('pending', 0)} pending, {len(active_worktrees)} parallel")
+
     def _get_level_progress_indicator(self, imp: dict, level: int) -> str:
         """Generate visual progress indicator for current level (Plan → Execute → Test)."""
         level_prefix = {1: 'mvp', 2: 'enhanced', 3: 'advanced'}.get(level, 'mvp')
@@ -1285,20 +1328,6 @@ Execute now.'''
             test_icon = '○'
 
         return f'<span class="level-progress">{plan_icon} → {exec_icon} → {test_icon}</span>'
-
-    def update_dashboard(self):
-        """Update HTML dashboard with parallel processing info."""
-        stats = self.db.get_stats()
-        level_stats = self.db.get_level_stats()
-        improvements = self.db.get_tasks_with_time_estimates()
-
-        # Get active worktrees for parallel task tracking
-        active_worktrees = self.worktree_mgr.get_active_worktrees()
-
-        html_content = self._generate_dashboard_html(improvements, stats, level_stats, active_worktrees)
-        dashboard_path = self.workspace_path / 'dashboard.html'
-        dashboard_path.write_text(html_content)
-        logger.info(f"Dashboard updated: {stats.get('completed', 0)} completed, {stats.get('pending', 0)} pending, {len(active_worktrees)} parallel")
 
     def _generate_dashboard_html(self, improvements: list, stats: dict, level_stats: dict,
                                    active_worktrees: List[Path] = None) -> str:
@@ -1344,11 +1373,6 @@ Execute now.'''
             # Current level progress indicator (Plan → Execute → Test)
             level_progress = self._get_level_progress_indicator(imp, level)
 
-            # Estimated time remaining
-            est_remaining = "–"
-            if imp.get('estimated_remaining') is not None:
-                est_remaining = self._format_duration(imp['estimated_remaining'])
-
             # Check if running in parallel worktree
             is_parallel = imp['id'] in active_ids
             parallel_indicator = '⚡' if is_parallel else ''
@@ -1361,7 +1385,6 @@ Execute now.'''
                 <td><span class="level-badge level-{level}">{level_name}</span> {level_progress}</td>
                 <td class="progress-cell">{progress}</td>
                 <td>{completed_level}</td>
-                <td>{est_remaining}</td>
                 <td><span class="status-badge {status_class}">{status}</span></td>
                 <td>{imp['priority']}</td>
             </tr>''')
@@ -1444,6 +1467,13 @@ Execute now.'''
         .level-badge.level-1 {{ background: rgba(34,197,94,0.2); color: #22c55e; }}
         .level-badge.level-2 {{ background: rgba(59,130,246,0.2); color: #3b82f6; }}
         .level-badge.level-3 {{ background: rgba(168,85,247,0.2); color: #a855f7; }}
+        .level-progress {{
+            font-size: 0.75rem;
+            color: #888;
+            font-family: monospace;
+            margin-left: 8px;
+            white-space: nowrap;
+        }}
         .progress-cell {{ font-family: monospace; letter-spacing: 2px; }}
         tr.completed {{ opacity: 0.7; }}
         tr.parallel {{ background: rgba(168,85,247,0.1); animation: pulse 2s infinite; }}
@@ -1482,13 +1512,12 @@ Execute now.'''
                     <th>Working On</th>
                     <th>Tests (M|E|A)</th>
                     <th>Completed At</th>
-                    <th>Est. Time Remaining</th>
                     <th>Status</th>
                     <th>Priority</th>
                 </tr>
             </thead>
             <tbody>
-                {''.join(rows) if rows else '<tr><td colspan="8" style="text-align:center;color:#888;">No improvements yet</td></tr>'}
+                {''.join(rows) if rows else '<tr><td colspan="7" style="text-align:center;color:#888;">No improvements yet</td></tr>'}
             </tbody>
         </table>
     </div>

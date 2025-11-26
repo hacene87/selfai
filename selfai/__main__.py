@@ -42,7 +42,7 @@ def install_launchagent():
     <array>
         <string>{python_path}</string>
         <string>-m</string>
-        <string>selfai</string>
+        <string>_selfai</string>
         <string>run</string>
     </array>
     <key>WorkingDirectory</key>
@@ -158,6 +158,42 @@ def open_dashboard():
     print(f"Opened dashboard: {dashboard_path}")
 
 
+def analyze_logs():
+    """Analyze recent logs and display issues found."""
+    repo_path = get_repo_root()
+    runner = Runner(repo_path)
+
+    print("\n=== Log Analysis ===")
+    print(f"Repository: {repo_path}")
+
+    # Run analysis
+    analysis = runner.log_analyzer.analyze_logs()
+
+    print(f"\nLog Summary:")
+    print(f"  Lines analyzed: {analysis.get('log_lines', 0)}")
+    print(f"  Issues found:   {analysis.get('issues_found', 0)}")
+
+    # Display issues
+    issues = analysis.get('issues', [])
+    if issues:
+        print(f"\nRecent Issues:")
+        for i, issue in enumerate(issues, 1):
+            issue_type = issue.get('type', 'unknown').upper()
+            detail = issue.get('detail', 'No details')[:80]
+            timestamp = issue.get('timestamp', '')[:19]
+            print(f"  {i}. [{issue_type}] {detail}")
+            print(f"     Time: {timestamp}")
+    else:
+        print("\n  No issues detected in recent logs.")
+
+    # Show log file location
+    log_file = runner.log_analyzer.logs_path / 'runner.log'
+    if log_file.exists():
+        print(f"\nLog file: {log_file}")
+
+    print()
+
+
 def run_once():
     """Run a single improvement cycle."""
     repo_path = get_repo_root()
@@ -188,57 +224,6 @@ def add_improvement(title: str, description: str = '', category: str = 'general'
     print(f"Added improvement #{imp_id}: {title}")
 
 
-def test_feature(feature_id: int):
-    """Run tests for a specific feature by ID."""
-    repo_path = get_repo_root()
-    runner = Runner(repo_path)
-
-    # Get the feature
-    improvement = runner.db.get_by_id(feature_id)
-    if not improvement:
-        print(f"Error: Feature #{feature_id} not found")
-        return False
-
-    title = improvement['title']
-    level = improvement['current_level']
-    level_name = {1: 'MVP', 2: 'Enhanced', 3: 'Advanced'}[level]
-    status = improvement['status']
-
-    print(f"\n=== Testing Feature #{feature_id} ===")
-    print(f"Title: {title}")
-    print(f"Level: {level_name} ({level}/3)")
-    print(f"Status: {status}")
-    print(f"\nTest Criteria for {level_name}:")
-    print(runner._get_test_criteria(level))
-    print("\nRunning tests...")
-
-    # Run the tests
-    runner._run_tests(improvement)
-
-    # Get updated status
-    updated = runner.db.get_by_id(feature_id)
-    level_col = level_name.lower()
-    test_status = updated.get(f'{level_col}_test_status', 'unknown')
-    test_output = updated.get(f'{level_col}_test_output', '')
-
-    print(f"\n=== Test Results ===")
-    print(f"Status: {test_status.upper()}")
-
-    if test_status == 'passed':
-        print(f"Feature #{feature_id} passed {level_name} tests!")
-        print(f"New status: {updated['status']}")
-    else:
-        print(f"Feature #{feature_id} failed {level_name} tests")
-        print(f"Retry count: {updated['retry_count']}")
-
-    if test_output:
-        print(f"\nTest Output (truncated):")
-        print(test_output[:500] + '...' if len(test_output) > 500 else test_output)
-
-    runner.update_dashboard()
-    return test_status == 'passed'
-
-
 def print_help():
     """Print usage help."""
     print("""
@@ -248,14 +233,14 @@ Usage:
     python -m _selfai <command> [options]
 
 Commands:
-    install     Install LaunchAgent (runs every 5 minutes)
-    uninstall   Remove LaunchAgent
-    run         Run a single improvement cycle (includes testing)
-    test <id>   Run tests for a specific feature by ID
-    status      Show current status with complexity & test stats
-    dashboard   Open dashboard in browser
-    add         Add a manual improvement
-    help        Show this help
+    install      Install LaunchAgent (runs every 5 minutes)
+    uninstall    Remove LaunchAgent
+    run          Run a single improvement cycle (includes testing)
+    status       Show current status with complexity & test stats
+    dashboard    Open dashboard in browser
+    analyze-logs Analyze recent logs for errors and issues
+    add          Add a manual improvement
+    help         Show this help
 
 Complexity Levels:
     1 = MVP       (Simple, working implementations)
@@ -271,9 +256,9 @@ Run Cycle:
 Examples:
     python -m _selfai install                  # Start autonomous improvements
     python -m _selfai run                      # Run once manually
-    python -m _selfai test 5                   # Test feature #5 manually
     python -m _selfai status                   # Check progress & test status
     python -m _selfai dashboard                # View in browser
+    python -m _selfai analyze-logs             # Check for errors in logs
     python -m _selfai add "Fix bug X"          # Add MVP-level task
     python -m _selfai add "Feature" "" "" 80 2 # Add Enhanced task (priority 80)
     python -m _selfai uninstall                # Stop autonomous runs
@@ -294,20 +279,12 @@ def main():
         uninstall_launchagent()
     elif command == 'run':
         run_once()
-    elif command == 'test':
-        if len(sys.argv) < 3:
-            print("Usage: python -m _selfai test <feature_id>")
-            return
-        try:
-            feature_id = int(sys.argv[2])
-        except ValueError:
-            print("Error: Feature ID must be an integer")
-            return
-        test_feature(feature_id)
     elif command == 'status':
         show_status()
     elif command == 'dashboard':
         open_dashboard()
+    elif command == 'analyze-logs':
+        analyze_logs()
     elif command == 'add':
         if len(sys.argv) < 3:
             print("Usage: python -m _selfai add \"title\" [description] [category] [priority]")
