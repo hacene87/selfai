@@ -11,6 +11,12 @@ logger = logging.getLogger('selfai')
 # Level names
 LEVEL_NAMES = {1: 'MVP', 2: 'Enhanced', 3: 'Advanced'}
 
+# Unlock thresholds: how many features must pass tests at previous level to unlock next level
+UNLOCK_THRESHOLDS = {
+    2: 5,   # Enhanced requires 5 MVP passes
+    3: 10   # Advanced requires 10 Enhanced passes
+}
+
 
 class Database:
     """SQLite database manager for improvements with progressive complexity."""
@@ -412,3 +418,43 @@ class Database:
             cursor = conn.execute(
                 'SELECT * FROM improvements WHERE current_level = ?', (level,))
             return [dict(row) for row in cursor.fetchall()]
+
+    def check_level_unlock(self, level: int) -> bool:
+        """Check if a level is unlocked based on passed tests at previous level.
+
+        Args:
+            level: The level to check (2 for Enhanced, 3 for Advanced)
+
+        Returns:
+            True if the level is unlocked, False otherwise.
+
+        Level 1 (MVP) is always unlocked.
+        Level 2 (Enhanced) requires 5 MVP passes.
+        Level 3 (Advanced) requires 10 Enhanced passes.
+        """
+        # Level 1 (MVP) is always unlocked
+        if level == 1:
+            return True
+
+        # Check if level has an unlock threshold
+        if level not in UNLOCK_THRESHOLDS:
+            return False
+
+        # Get the previous level and count passed tests
+        prev_level = level - 1
+        prev_level_col = {1: 'mvp', 2: 'enhanced', 3: 'advanced'}[prev_level]
+        threshold = UNLOCK_THRESHOLDS[level]
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                f"SELECT COUNT(*) FROM improvements WHERE {prev_level_col}_test_status = 'passed'"
+            )
+            passed_count = cursor.fetchone()[0]
+
+        is_unlocked = passed_count >= threshold
+        if is_unlocked:
+            logger.info(f"Level {level} ({LEVEL_NAMES[level]}) is UNLOCKED: {passed_count}/{threshold} tests passed")
+        else:
+            logger.info(f"Level {level} ({LEVEL_NAMES[level]}) is LOCKED: {passed_count}/{threshold} tests passed")
+
+        return is_unlocked
