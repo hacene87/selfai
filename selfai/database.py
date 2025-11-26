@@ -316,3 +316,29 @@ class Database:
             cursor = conn.execute('SELECT * FROM improvements WHERE id = ?', (imp_id,))
             row = cursor.fetchone()
             return dict(row) if row else None
+
+    def progress_all_to_level(self, next_level: int) -> int:
+        """Progress all completed features to the next level.
+
+        Moves all features with status='completed' to:
+        - current_level = next_level
+        - status = 'pending'
+
+        Returns the number of features moved.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute('''
+                UPDATE improvements
+                SET current_level = ?, status = 'pending'
+                WHERE status = 'completed'
+            ''', (next_level,))
+            conn.commit()
+            return cursor.rowcount
+
+    def get_all_at_level(self, level: int) -> List[Dict]:
+        """Get all features currently at a specific level."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                'SELECT * FROM improvements WHERE current_level = ?', (level,))
+            return [dict(row) for row in cursor.fetchall()]

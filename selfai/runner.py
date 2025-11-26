@@ -527,14 +527,26 @@ class Runner:
                 self._run_parallel_improvements(pending_batch)
                 tasks_processed += len(pending_batch)
 
-            # Phase 4: Only discover NEW features after all existing are complete
+            # Phase 4: Check if current level is complete and progress to next
             stats = self.db.get_stats()
-            if stats.get('completed', 0) > 0 and stats.get('pending', 0) == 0 and stats.get('testing', 0) == 0:
-                logger.info("All existing features tested - discovering new improvements...")
-                self._run_discovery()
+            if stats.get('pending', 0) == 0 and stats.get('testing', 0) == 0 and stats.get('in_progress', 0) == 0:
+                # All features at current level are complete
+                level_stats = self.db.get_level_stats()
+                current_level = self._get_current_batch_level()
 
-                # Phase 5: Self-improvement thinking (after discovery)
-                self._think_about_self_improvement(stats)
+                if current_level < 3:
+                    # Progress all features to next level
+                    next_level = current_level + 1
+                    level_names = {1: 'MVP', 2: 'Enhanced', 3: 'Advanced'}
+                    logger.info(f"All features completed {level_names[current_level]} - progressing to {level_names[next_level]}...")
+                    self._progress_all_to_next_level(next_level)
+                else:
+                    # All features completed all 3 levels - discover NEW features
+                    logger.info("All features completed all 3 levels - discovering new improvements...")
+                    self._run_discovery()
+
+                    # Self-improvement thinking (after discovery)
+                    self._think_about_self_improvement(stats)
 
             # Log analysis AFTER completing tasks
             post_analysis = self.log_analyzer.analyze_logs()
@@ -552,6 +564,35 @@ class Runner:
             self.release_lock()
             self.update_dashboard()
             self._check_self_deploy()
+
+    def _get_current_batch_level(self) -> int:
+        """Determine the current batch level based on completed tests.
+
+        Returns the highest level where ALL features have passed tests.
+        """
+        stats = self.db.get_level_stats()
+        total = self.db.get_stats().get('total', 0)
+
+        if total == 0:
+            return 1
+
+        # Check from highest to lowest
+        for level in [3, 2, 1]:
+            passed = stats.get(level, {}).get('passed', 0)
+            if passed == total:
+                return level
+
+        # Default to level 1 (MVP)
+        return 1
+
+    def _progress_all_to_next_level(self, next_level: int):
+        """Progress all completed features to the next level."""
+        level_names = {1: 'MVP', 2: 'Enhanced', 3: 'Advanced'}
+        logger.info(f"Progressing all features to {level_names[next_level]} level...")
+
+        # Get all completed features and move them to next level
+        count = self.db.progress_all_to_level(next_level)
+        logger.info(f"Moved {count} features to {level_names[next_level]} (pending)")
 
     def _diagnose_and_fix_issues(self, issues: List[Dict]):
         """Attempt to automatically diagnose and fix detected issues.
@@ -972,36 +1013,52 @@ Remember: Focus on HIGH-LEVEL capabilities, NOT individual functions.'''
             logger.info(f"Fallback parser added {len(found)} features")
 
     def _run_discovery(self):
-        """Discover NEW improvements for the repository (after existing are tested)."""
+        """Discover NEW improvements from web research (after all levels complete)."""
         completed = self.db.get_completed_features()
-        completed_context = "\n".join([f"  - {f}" for f in completed[-10:]]) if completed else "  None yet"
+        completed_context = "\n".join([f"  - {f}" for f in completed[-15:]]) if completed else "  None yet"
 
-        prompt = f'''Analyze this repository and suggest 3-5 NEW improvements to add.
+        # Read project description to understand what it does
+        readme_content = ""
+        readme_path = self.repo_path / "README.md"
+        if readme_path.exists():
+            readme_content = readme_path.read_text()[:2000]
 
-Repository: {self.repo_path}
+        prompt = f'''You are researching NEW features to add to this project.
 
-ALREADY IMPLEMENTED (do not duplicate):
+PROJECT: {self.repo_path.name}
+{f"DESCRIPTION: {readme_content[:500]}" if readme_content else ""}
+
+ALREADY IMPLEMENTED (DO NOT DUPLICATE):
 {completed_context}
 
-IMPORTANT:
-- Read existing files to understand the codebase
-- Focus on gaps and missing functionality
-- Each improvement will go through MVP → Enhanced → Advanced progression
-- Be specific with file paths and requirements
+YOUR TASK:
+1. Understand what this project does
+2. Research (using web search if available) what similar projects have
+3. Suggest HIGH-VALUE features that would make this project better
+4. Focus on features that are IMPORTANT and PRACTICAL
+
+REQUIREMENTS:
+- Each feature must be UNIQUE (not duplicating existing)
+- Each feature must be VALUABLE to users
+- Features should be HIGH-LEVEL capabilities (not functions)
+- Prioritize: security, reliability, usability, performance
+- Be conservative - only suggest truly useful features
 
 OUTPUT FORMAT:
 ```json
 {{
   "improvements": [
     {{
-      "title": "Clear 5-10 word title",
-      "description": "Detailed description: WHY needed, WHAT to change, HOW it fits",
-      "category": "feature|testing|security|performance|refactoring",
+      "title": "Clear high-level feature name",
+      "description": "WHY this is valuable, WHAT it does, HOW it improves the project",
+      "category": "feature|security|reliability|performance|usability",
       "priority": 1-100
     }}
   ]
 }}
-```'''
+```
+
+Remember: Quality over quantity. Only suggest features that truly matter.'''
 
         result = self._execute_claude(prompt, timeout=600)
         if result['success']:
