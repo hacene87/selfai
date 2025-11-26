@@ -64,11 +64,7 @@ class Database:
                     enhanced_completed_at TEXT,
                     advanced_completed_at TEXT,
 
-<<<<<<< HEAD
                     -- Durations in seconds
-=======
-                    -- Duration tracking (in seconds)
->>>>>>> feature/67-dashboard-estimated-time-remaining
                     mvp_duration INTEGER,
                     enhanced_duration INTEGER,
                     advanced_duration INTEGER,
@@ -101,21 +97,12 @@ class Database:
                 'ALTER TABLE improvements ADD COLUMN mvp_duration INTEGER',
                 'ALTER TABLE improvements ADD COLUMN enhanced_duration INTEGER',
                 'ALTER TABLE improvements ADD COLUMN advanced_duration INTEGER',
-<<<<<<< HEAD
                 ]
                 for migration in migrations:
                     try:
                         conn.execute(migration)
                     except sqlite3.OperationalError:
                         pass
-=======
-            ]
-            for migration in migrations:
-                try:
-                    conn.execute(migration)
-                except sqlite3.OperationalError:
-                    pass
->>>>>>> feature/67-dashboard-estimated-time-remaining
 
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_status ON improvements(status)')
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_priority ON improvements(priority)')
@@ -191,25 +178,16 @@ class Database:
         """Mark current level as completed, move to testing."""
         level_col = {1: 'mvp', 2: 'enhanced', 3: 'advanced'}[level]
         with sqlite3.connect(self.db_path) as conn:
-<<<<<<< HEAD
             # Get started_at to calculate duration
-=======
-            # Get started_at timestamp to calculate duration
->>>>>>> feature/67-dashboard-estimated-time-remaining
             cursor = conn.execute('SELECT started_at FROM improvements WHERE id = ?', (imp_id,))
             row = cursor.fetchone()
             duration = None
             if row and row[0]:
-<<<<<<< HEAD
                 try:
                     started_at = datetime.fromisoformat(row[0])
                     duration = int((datetime.now() - started_at).total_seconds())
                 except (ValueError, AttributeError):
                     pass
-=======
-                started_at = datetime.fromisoformat(row[0])
-                duration = int((datetime.now() - started_at).total_seconds())
->>>>>>> feature/67-dashboard-estimated-time-remaining
 
             conn.execute(f'''
                 UPDATE improvements
@@ -409,58 +387,6 @@ class Database:
             row = cursor.fetchone()
             return dict(row) if row else None
 
-    def get_success_fail_stats(self) -> Dict:
-        """Get success/fail statistics and retry metrics.
-
-        Returns:
-            Dict with:
-            - total_passed: Total tests passed across all levels
-            - total_failed: Total tests failed across all levels
-            - success_rate: Percentage of passed tests (0-100)
-            - total_retries: Sum of all retry counts
-            - avg_retries: Average retries per feature
-            - mvp_passed: Count of MVP tests passed
-            - mvp_failed: Count of MVP tests failed
-            - enhanced_passed: Count of Enhanced tests passed
-            - enhanced_failed: Count of Enhanced tests failed
-            - advanced_passed: Count of Advanced tests passed
-            - advanced_failed: Count of Advanced tests failed
-        """
-        with sqlite3.connect(self.db_path) as conn:
-            stats = {}
-
-            # Count passed/failed tests for each level
-            for level, level_col in [(1, 'mvp'), (2, 'enhanced'), (3, 'advanced')]:
-                cursor = conn.execute(
-                    f"SELECT COUNT(*) FROM improvements WHERE {level_col}_test_status = 'passed'")
-                stats[f'{level_col}_passed'] = cursor.fetchone()[0]
-
-                cursor = conn.execute(
-                    f"SELECT COUNT(*) FROM improvements WHERE {level_col}_test_status = 'failed'")
-                stats[f'{level_col}_failed'] = cursor.fetchone()[0]
-
-            # Total passed/failed across all levels
-            stats['total_passed'] = (stats['mvp_passed'] + stats['enhanced_passed'] +
-                                    stats['advanced_passed'])
-            stats['total_failed'] = (stats['mvp_failed'] + stats['enhanced_failed'] +
-                                    stats['advanced_failed'])
-
-            # Success rate
-            total_tests = stats['total_passed'] + stats['total_failed']
-            if total_tests > 0:
-                stats['success_rate'] = round((stats['total_passed'] / total_tests) * 100, 1)
-            else:
-                stats['success_rate'] = 0.0
-
-            # Retry metrics
-            cursor = conn.execute("SELECT SUM(retry_count), COUNT(*) FROM improvements")
-            row = cursor.fetchone()
-            stats['total_retries'] = row[0] if row[0] else 0
-            feature_count = row[1] if row[1] else 0
-            stats['avg_retries'] = round(stats['total_retries'] / feature_count, 1) if feature_count > 0 else 0.0
-
-            return stats
-
     def progress_all_to_level(self, next_level: int) -> int:
         """Progress all completed features to the next level.
 
@@ -486,39 +412,3 @@ class Database:
             cursor = conn.execute(
                 'SELECT * FROM improvements WHERE current_level = ?', (level,))
             return [dict(row) for row in cursor.fetchall()]
-
-    def get_average_duration_by_level(self) -> Dict[int, Optional[float]]:
-        """Get average completion duration for each level in seconds."""
-        with sqlite3.connect(self.db_path) as conn:
-            averages = {}
-            for level in [1, 2, 3]:
-                level_col = {1: 'mvp', 2: 'enhanced', 3: 'advanced'}[level]
-                cursor = conn.execute(
-                    f'SELECT AVG({level_col}_duration) FROM improvements WHERE {level_col}_duration IS NOT NULL')
-                result = cursor.fetchone()[0]
-                averages[level] = result if result else None
-            return averages
-
-    def get_tasks_with_time_estimates(self) -> List[Dict]:
-        """Get all tasks with estimated time remaining for in-progress tasks."""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.execute('SELECT * FROM improvements ORDER BY id DESC')
-            tasks = [dict(row) for row in cursor.fetchall()]
-
-            # Get average durations for each level
-            avg_durations = self.get_average_duration_by_level()
-
-            # Calculate time estimates for each task
-            for task in tasks:
-                task['estimated_remaining'] = None
-                if task['status'] in ['in_progress', 'testing'] and task['started_at']:
-                    level = task['current_level']
-                    avg_duration = avg_durations.get(level)
-                    if avg_duration:
-                        started_at = datetime.fromisoformat(task['started_at'])
-                        elapsed = (datetime.now() - started_at).total_seconds()
-                        remaining = avg_duration - elapsed
-                        task['estimated_remaining'] = max(0, remaining)  # Don't show negative time
-
-            return tasks
