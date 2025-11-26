@@ -540,12 +540,42 @@ class Runner:
                 logger.warning(f"Post-run log check: {new_issues} new issues detected")
                 self.log_analyzer.save_issues(post_analysis['issues'])
 
+                # Self-diagnosis: Try to fix new issues automatically
+                self._diagnose_and_fix_issues(post_analysis['issues'][-new_issues:])
+
             logger.info(f"Run completed: {tasks_processed} tasks in {self._format_duration(time.time() - start_time)}")
 
         finally:
             self.release_lock()
             self.update_dashboard()
             self._check_self_deploy()
+
+    def _diagnose_and_fix_issues(self, issues: List[Dict]):
+        """Attempt to automatically diagnose and fix detected issues.
+
+        Uses Claude to analyze issues and apply fixes to the codebase.
+        Only attempts to fix issues that are likely code-related.
+        """
+        if not issues:
+            return
+
+        # Only attempt to fix certain types of issues
+        fixable_types = {'error', 'exception', 'failure'}
+
+        for issue in issues[:3]:  # Limit to 3 fixes per run to avoid loops
+            if issue.get('type') not in fixable_types:
+                continue
+
+            logger.info(f"Attempting to diagnose issue: {issue.get('type')} - {issue.get('detail', '')[:50]}")
+
+            try:
+                result = self.log_analyzer.diagnose_and_fix(issue, self.repo_path)
+                if result:
+                    logger.info(f"Self-diagnosis applied fix: {result[:100]}")
+                else:
+                    logger.info(f"Could not auto-fix issue: {issue.get('detail', '')[:50]}")
+            except Exception as e:
+                logger.warning(f"Self-diagnosis failed: {e}")
 
     def _get_batch_needs_testing(self, max_count: int) -> List[Dict]:
         """Get batch of improvements that need testing (unique only)."""
