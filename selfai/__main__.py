@@ -171,25 +171,21 @@ def run_once():
 
 
 def add_improvement(title: str, description: str = '', category: str = 'general',
-                    priority: int = 50, complexity_level: int = 1):
-    """Add a manual improvement with complexity level."""
+                    priority: int = 50):
+    """Add a manual improvement (starts at MVP level)."""
     repo_path = get_repo_root()
     runner = Runner(repo_path)
-
-    complexity_names = {1: 'MVP', 2: 'Enhanced', 3: 'Advanced'}
-    level_name = complexity_names.get(complexity_level, 'MVP')
 
     imp_id = runner.db.add(
         title=title,
         description=description,
         category=category,
         priority=priority,
-        source='manual',
-        complexity_level=complexity_level
+        source='manual'
     )
 
     runner.update_dashboard()
-    print(f"Added improvement #{imp_id} [{level_name}]: {title}")
+    print(f"Added improvement #{imp_id}: {title}")
 
 
 def print_help():
@@ -251,15 +247,13 @@ def main():
         open_dashboard()
     elif command == 'add':
         if len(sys.argv) < 3:
-            print("Usage: python -m _selfai add \"title\" [description] [category] [priority] [complexity]")
-            print("  complexity: 1=MVP, 2=Enhanced, 3=Advanced")
+            print("Usage: python -m _selfai add \"title\" [description] [category] [priority]")
             return
         title = sys.argv[2]
         description = sys.argv[3] if len(sys.argv) > 3 else ''
         category = sys.argv[4] if len(sys.argv) > 4 else 'general'
         priority = int(sys.argv[5]) if len(sys.argv) > 5 else 50
-        complexity_level = int(sys.argv[6]) if len(sys.argv) > 6 else 1
-        add_improvement(title, description, category, priority, complexity_level)
+        add_improvement(title, description, category, priority)
     elif command in ('help', '-h', '--help'):
         print_help()
     else:
