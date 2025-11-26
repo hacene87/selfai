@@ -1277,6 +1277,29 @@ Execute now.'''
         dashboard_path.write_text(html_content)
         logger.info(f"Dashboard updated: {stats.get('completed', 0)} completed, {stats.get('pending', 0)} pending, {len(active_worktrees)} parallel")
 
+    def _get_level_progress_indicator(self, imp: dict, level: int) -> str:
+        """Generate visual progress indicator for current level (Plan → Execute → Test)."""
+        level_prefix = {1: 'mvp', 2: 'enhanced', 3: 'advanced'}.get(level, 'mvp')
+
+        # Check what's completed at this level
+        has_plan = imp.get(f'{level_prefix}_plan') is not None
+        has_output = imp.get(f'{level_prefix}_output') is not None
+        test_status = imp.get(f'{level_prefix}_test_status', 'pending')
+
+        # Build progress indicator based on workflow stage
+        # ○ = pending, ● = completed/in-progress, ✓ = passed, ✗ = failed
+        plan_icon = '●' if has_plan else '○'
+        exec_icon = '●' if has_output else '○'
+
+        if test_status == 'passed':
+            test_icon = '✓'
+        elif test_status == 'failed':
+            test_icon = '✗'
+        else:
+            test_icon = '○'
+
+        return f'<span class="level-progress">{plan_icon} → {exec_icon} → {test_icon}</span>'
+
     def _generate_dashboard_html(self, improvements: list, stats: dict, level_stats: dict,
                                    active_worktrees: List[Path] = None) -> str:
         """Generate dashboard HTML with parallel task tracking."""
@@ -1318,6 +1341,9 @@ Execute now.'''
             elif mvp_test == 'passed':
                 completed_level = "MVP"
 
+            # Current level progress indicator (Plan → Execute → Test)
+            level_progress = self._get_level_progress_indicator(imp, level)
+
             # Check if running in parallel worktree
             is_parallel = imp['id'] in active_ids
             parallel_indicator = '⚡' if is_parallel else ''
@@ -1327,7 +1353,7 @@ Execute now.'''
             <tr class="{status_class}{' parallel' if is_parallel else ''}">
                 <td>{imp['id']}</td>
                 <td>{parallel_indicator} {html.escape(imp['title'])}</td>
-                <td><span class="level-badge level-{level}">{level_name}</span></td>
+                <td><span class="level-badge level-{level}">{level_name}</span> {level_progress}</td>
                 <td class="progress-cell">{progress}</td>
                 <td>{completed_level}</td>
                 <td><span class="status-badge {status_class}">{status}</span></td>
@@ -1412,6 +1438,13 @@ Execute now.'''
         .level-badge.level-1 {{ background: rgba(34,197,94,0.2); color: #22c55e; }}
         .level-badge.level-2 {{ background: rgba(59,130,246,0.2); color: #3b82f6; }}
         .level-badge.level-3 {{ background: rgba(168,85,247,0.2); color: #a855f7; }}
+        .level-progress {{
+            font-size: 0.75rem;
+            color: #888;
+            font-family: monospace;
+            margin-left: 8px;
+            white-space: nowrap;
+        }}
         .progress-cell {{ font-family: monospace; letter-spacing: 2px; }}
         tr.completed {{ opacity: 0.7; }}
         tr.parallel {{ background: rgba(168,85,247,0.1); animation: pulse 2s infinite; }}
