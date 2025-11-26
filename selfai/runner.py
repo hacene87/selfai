@@ -1277,6 +1277,42 @@ Execute now.'''
         dashboard_path.write_text(html_content)
         logger.info(f"Dashboard updated: {stats.get('completed', 0)} completed, {stats.get('pending', 0)} pending, {len(active_worktrees)} parallel")
 
+    def _format_duration(self, start_time: str, end_time: str) -> str:
+        """Calculate and format duration between two timestamps."""
+        if not start_time or not end_time:
+            return "–"
+        try:
+            from datetime import datetime
+            start = datetime.fromisoformat(start_time)
+            end = datetime.fromisoformat(end_time)
+            duration = end - start
+
+            # Format as human-readable
+            seconds = int(duration.total_seconds())
+            if seconds < 60:
+                return f"{seconds}s"
+            elif seconds < 3600:
+                minutes = seconds // 60
+                secs = seconds % 60
+                return f"{minutes}m {secs}s"
+            else:
+                hours = seconds // 3600
+                minutes = (seconds % 3600) // 60
+                return f"{hours}h {minutes}m"
+        except Exception:
+            return "–"
+
+    def _format_timestamp(self, timestamp: str) -> str:
+        """Format timestamp to readable format."""
+        if not timestamp:
+            return "–"
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(timestamp)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return "–"
+
     def _generate_dashboard_html(self, improvements: list, stats: dict, level_stats: dict,
                                    active_worktrees: List[Path] = None) -> str:
         """Generate dashboard HTML with parallel task tracking."""
@@ -1322,17 +1358,93 @@ Execute now.'''
             is_parallel = imp['id'] in active_ids
             parallel_indicator = '⚡' if is_parallel else ''
 
+            # Get timestamps and durations
+            created = self._format_timestamp(imp.get('created_at', ''))
+            started = self._format_timestamp(imp.get('started_at', ''))
+
+            # Calculate level-specific durations
+            mvp_completed = imp.get('mvp_completed_at', '')
+            enh_completed = imp.get('enhanced_completed_at', '')
+            adv_completed = imp.get('advanced_completed_at', '')
+
+            mvp_duration = self._format_duration(imp.get('created_at', ''), mvp_completed) if mvp_completed else "–"
+            enh_duration = self._format_duration(mvp_completed, enh_completed) if enh_completed else "–"
+            adv_duration = self._format_duration(enh_completed, adv_completed) if adv_completed else "–"
+
+            # Build expandable details for plans and test outputs
+            imp_id = imp['id']
+            details_rows = []
+
+            # MVP details
+            mvp_plan = imp.get('mvp_plan', '')
+            mvp_output = imp.get('mvp_output', '')
+            mvp_test_output = imp.get('mvp_test_output', '')
+            if mvp_plan or mvp_output or mvp_test_output:
+                details_rows.append(f'''
+                    <tr class="detail-row" id="detail-{imp_id}" style="display: none;">
+                        <td colspan="8">
+                            <div class="detail-content">
+                                <h4>MVP Level</h4>
+                                {f'<div class="detail-section"><strong>Duration:</strong> {mvp_duration}</div>' if mvp_duration != "–" else ''}
+                                {f'<div class="detail-section"><strong>Completed:</strong> {self._format_timestamp(mvp_completed)}</div>' if mvp_completed else ''}
+                                {f'<div class="detail-section"><strong>Plan:</strong><pre>{html.escape(mvp_plan)}</pre></div>' if mvp_plan else ''}
+                                {f'<div class="detail-section"><strong>Output:</strong><pre>{html.escape(mvp_output[:500])}</pre></div>' if mvp_output else ''}
+                                {f'<div class="detail-section"><strong>Test Result:</strong><pre class="test-{mvp_test}">{html.escape(mvp_test_output[:500])}</pre></div>' if mvp_test_output else ''}
+                            </div>
+                        </td>
+                    </tr>''')
+
+            # Enhanced details
+            enh_plan = imp.get('enhanced_plan', '')
+            enh_output = imp.get('enhanced_output', '')
+            enh_test_output = imp.get('enhanced_test_output', '')
+            if enh_plan or enh_output or enh_test_output:
+                details_rows.append(f'''
+                    <tr class="detail-row" id="detail-{imp_id}-enh" style="display: none;">
+                        <td colspan="8">
+                            <div class="detail-content">
+                                <h4>Enhanced Level</h4>
+                                {f'<div class="detail-section"><strong>Duration:</strong> {enh_duration}</div>' if enh_duration != "–" else ''}
+                                {f'<div class="detail-section"><strong>Completed:</strong> {self._format_timestamp(enh_completed)}</div>' if enh_completed else ''}
+                                {f'<div class="detail-section"><strong>Plan:</strong><pre>{html.escape(enh_plan)}</pre></div>' if enh_plan else ''}
+                                {f'<div class="detail-section"><strong>Output:</strong><pre>{html.escape(enh_output[:500])}</pre></div>' if enh_output else ''}
+                                {f'<div class="detail-section"><strong>Test Result:</strong><pre class="test-{enh_test}">{html.escape(enh_test_output[:500])}</pre></div>' if enh_test_output else ''}
+                            </div>
+                        </td>
+                    </tr>''')
+
+            # Advanced details
+            adv_plan = imp.get('advanced_plan', '')
+            adv_output = imp.get('advanced_output', '')
+            adv_test_output = imp.get('advanced_test_output', '')
+            if adv_plan or adv_output or adv_test_output:
+                details_rows.append(f'''
+                    <tr class="detail-row" id="detail-{imp_id}-adv" style="display: none;">
+                        <td colspan="8">
+                            <div class="detail-content">
+                                <h4>Advanced Level</h4>
+                                {f'<div class="detail-section"><strong>Duration:</strong> {adv_duration}</div>' if adv_duration != "–" else ''}
+                                {f'<div class="detail-section"><strong>Completed:</strong> {self._format_timestamp(adv_completed)}</div>' if adv_completed else ''}
+                                {f'<div class="detail-section"><strong>Plan:</strong><pre>{html.escape(adv_plan)}</pre></div>' if adv_plan else ''}
+                                {f'<div class="detail-section"><strong>Output:</strong><pre>{html.escape(adv_output[:500])}</pre></div>' if adv_output else ''}
+                                {f'<div class="detail-section"><strong>Test Result:</strong><pre class="test-{adv_test}">{html.escape(adv_test_output[:500])}</pre></div>' if adv_test_output else ''}
+                            </div>
+                        </td>
+                    </tr>''')
+
             status_class = status.replace('_', '-')
+            expand_button = f'<button class="expand-btn" onclick="toggleDetails({imp_id})">▶</button>' if details_rows else ''
+
             rows.append(f'''
-            <tr class="{status_class}{' parallel' if is_parallel else ''}">
-                <td>{imp['id']}</td>
+            <tr class="{status_class}{' parallel' if is_parallel else ''} clickable" onclick="toggleDetails({imp_id})">
+                <td>{expand_button} {imp_id}</td>
                 <td>{parallel_indicator} {html.escape(imp['title'])}</td>
                 <td><span class="level-badge level-{level}">{level_name}</span></td>
                 <td class="progress-cell">{progress}</td>
-                <td>{completed_level}</td>
+                <td class="timestamp-cell">{started}</td>
                 <td><span class="status-badge {status_class}">{status}</span></td>
                 <td>{imp['priority']}</td>
-            </tr>''')
+            </tr>{''.join(details_rows)}''')
 
         return f'''<!DOCTYPE html>
 <html lang="en">
@@ -1413,10 +1525,72 @@ Execute now.'''
         .level-badge.level-2 {{ background: rgba(59,130,246,0.2); color: #3b82f6; }}
         .level-badge.level-3 {{ background: rgba(168,85,247,0.2); color: #a855f7; }}
         .progress-cell {{ font-family: monospace; letter-spacing: 2px; }}
+        .timestamp-cell {{ font-size: 0.85rem; color: #aaa; }}
         tr.completed {{ opacity: 0.7; }}
         tr.parallel {{ background: rgba(168,85,247,0.1); animation: pulse 2s infinite; }}
+        tr.clickable {{ cursor: pointer; }}
+        tr.clickable:hover {{ background: rgba(255,255,255,0.08); }}
+        .expand-btn {{
+            background: none;
+            border: none;
+            color: #888;
+            cursor: pointer;
+            font-size: 0.8rem;
+            padding: 0;
+            margin-right: 5px;
+            transition: transform 0.3s;
+        }}
+        .expand-btn.expanded {{ transform: rotate(90deg); }}
+        .detail-row {{ background: rgba(0,0,0,0.3); }}
+        .detail-content {{
+            padding: 20px;
+            margin: 10px;
+            background: rgba(255,255,255,0.05);
+            border-radius: 8px;
+        }}
+        .detail-content h4 {{
+            color: #00d4ff;
+            margin-bottom: 15px;
+            font-size: 1.1rem;
+        }}
+        .detail-section {{
+            margin-bottom: 15px;
+        }}
+        .detail-section strong {{
+            color: #888;
+            display: block;
+            margin-bottom: 5px;
+        }}
+        .detail-section pre {{
+            background: rgba(0,0,0,0.3);
+            padding: 10px;
+            border-radius: 4px;
+            overflow-x: auto;
+            font-size: 0.85rem;
+            color: #ddd;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }}
+        .detail-section pre.test-passed {{ border-left: 3px solid #22c55e; }}
+        .detail-section pre.test-failed {{ border-left: 3px solid #ef4444; }}
         @keyframes pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.7; }} }}
     </style>
+    <script>
+        function toggleDetails(id) {{
+            const detailRows = document.querySelectorAll(`[id^="detail-${{id}}"]`);
+            const expandBtn = document.querySelector(`tr.clickable[onclick="toggleDetails(${{id}})"] .expand-btn`);
+
+            detailRows.forEach(row => {{
+                if (row.style.display === 'none') {{
+                    row.style.display = 'table-row';
+                    if (expandBtn) expandBtn.classList.add('expanded');
+                }} else {{
+                    row.style.display = 'none';
+                    if (expandBtn) expandBtn.classList.remove('expanded');
+                }}
+            }});
+        }}
+    </script>
 </head>
 <body>
     <div class="container">
@@ -1449,7 +1623,7 @@ Execute now.'''
                     <th>Feature</th>
                     <th>Working On</th>
                     <th>Tests (M|E|A)</th>
-                    <th>Completed At</th>
+                    <th>Started At</th>
                     <th>Status</th>
                     <th>Priority</th>
                 </tr>
