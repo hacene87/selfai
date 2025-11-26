@@ -786,7 +786,7 @@ class Runner:
 
         logger.info(f"Running {level_name} tests for: {title}")
 
-        test_prompt = f'''You are testing a {level_name} implementation.
+        test_prompt = f'''You are testing and FIXING a {level_name} implementation.
 
 Repository: {self.repo_path}
 Feature: {title}
@@ -796,21 +796,32 @@ Description: {improvement.get('description', '')}
 TEST CRITERIA FOR {level_name}:
 {self._get_test_criteria(level)}
 
-INSTRUCTIONS:
-1. Find and run any existing tests
-2. Verify the {level_name} implementation works
-3. Check for obvious bugs or issues
-4. Report results
+YOUR MISSION (in order):
+1. READ the relevant code files to understand what was implemented
+2. VERIFY the implementation works by checking imports, syntax, logic
+3. If ANY issues are found, FIX THEM IMMEDIATELY - don't just report
+4. RUN any existing tests if available
+5. Only mark as PASSED if the feature genuinely works
+
+CRITICAL: You MUST try to FIX any issues you find, not just report them!
+- If imports are missing, add them
+- If there are syntax errors, fix them
+- If logic is broken, repair it
+- Be thorough and actually verify the code runs
+
+After fixing any issues, report the final status:
 
 OUTPUT FORMAT:
 ```json
 {{
   "test_passed": true/false,
-  "tests_run": ["list of tests"],
-  "issues_found": ["any issues"],
-  "ready_for_next_level": true/false
+  "tests_run": ["list of verifications performed"],
+  "issues_fixed": ["list of issues you fixed"],
+  "remaining_issues": ["only issues you could NOT fix"]
 }}
-```'''
+```
+
+Remember: Your goal is to make this feature WORK, not just test it!'''
 
         result = self._execute_claude(test_prompt, timeout=300)
 
@@ -1231,13 +1242,17 @@ Execute now.'''
                  'Edit', 'Write', 'Bash', 'Glob', 'Grep', 'Read'],
                 capture_output=True, text=True, timeout=timeout, cwd=str(exec_path)
             )
+            if result.returncode != 0:
+                logger.error(f"Claude CLI failed: {result.stderr[:500] if result.stderr else 'No error output'}")
             return {'success': result.returncode == 0, 'output': result.stdout, 'error': result.stderr}
         except subprocess.TimeoutExpired:
             logger.warning(f"Claude call timed out after {timeout}s")
             return {'success': False, 'error': f'Timeout after {timeout}s'}
         except FileNotFoundError:
+            logger.error("Claude CLI not found - ensure 'claude' is in PATH")
             return {'success': False, 'error': 'Claude CLI not found'}
         except Exception as e:
+            logger.error(f"Claude execution error: {e}")
             return {'success': False, 'error': str(e)}
 
     def _format_duration(self, seconds: float) -> str:
