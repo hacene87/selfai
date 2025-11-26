@@ -13,6 +13,11 @@ PARALLEL PROCESSING WITH GIT WORKTREES:
 - Successful tests merge to main automatically
 - Conflicts resolved with Claude assistance
 - Up to 5 parallel tasks supported
+
+SELF-IMPROVEMENT & LOG ANALYSIS:
+- Analyzes logs before/during/after each task
+- Diagnoses and fixes issues automatically
+- Learns from patterns to improve itself
 """
 import os
 import subprocess
@@ -199,6 +204,164 @@ After resolving, the file should have NO conflict markers (<<<, ===, >>>).'''
         return worktrees
 
 
+class LogAnalyzer:
+    """Analyze logs to diagnose issues and suggest improvements."""
+
+    ERROR_PATTERNS = [
+        (r'ERROR.*?:(.+)', 'error'),
+        (r'Exception:(.+)', 'exception'),
+        (r'Traceback', 'traceback'),
+        (r'Failed to(.+)', 'failure'),
+        (r'Timeout', 'timeout'),
+        (r'CONFLICT', 'conflict'),
+    ]
+
+    def __init__(self, logs_path: Path, claude_cmd: str):
+        self.logs_path = logs_path
+        self.claude_cmd = claude_cmd
+        self.issues_file = logs_path / 'issues.json'
+        self.improvements_file = logs_path / 'self_improvements.json'
+
+    def get_recent_logs(self, lines: int = 100) -> str:
+        """Get recent log entries."""
+        log_file = self.logs_path / 'runner.log'
+        if not log_file.exists():
+            return ""
+        try:
+            content = log_file.read_text()
+            return '\n'.join(content.split('\n')[-lines:])
+        except Exception:
+            return ""
+
+    def analyze_logs(self) -> Dict:
+        """Analyze logs for errors and patterns."""
+        logs = self.get_recent_logs(200)
+        issues = []
+
+        for pattern, issue_type in self.ERROR_PATTERNS:
+            matches = re.findall(pattern, logs, re.IGNORECASE)
+            for match in matches:
+                issues.append({
+                    'type': issue_type,
+                    'detail': match if isinstance(match, str) else str(match),
+                    'timestamp': datetime.now().isoformat()
+                })
+
+        return {
+            'issues_found': len(issues),
+            'issues': issues[-10:],  # Keep last 10
+            'log_lines': len(logs.split('\n'))
+        }
+
+    def diagnose_and_fix(self, issue: Dict, repo_path: Path) -> Optional[str]:
+        """Use Claude to diagnose and fix an issue."""
+        prompt = f'''Analyze this issue from the SelfAI system and suggest a fix.
+
+Issue Type: {issue.get('type')}
+Detail: {issue.get('detail')}
+
+Recent logs context:
+{self.get_recent_logs(50)}
+
+Repository: {repo_path}
+
+TASK:
+1. Understand what went wrong
+2. Identify the root cause
+3. If it's a code issue, fix it
+4. If it's a configuration issue, adjust it
+5. Report what you did
+
+Be concise and actionable.'''
+
+        try:
+            result = subprocess.run(
+                [self.claude_cmd, '-p', prompt, '--allowedTools',
+                 'Read', 'Edit', 'Grep', 'Glob'],
+                capture_output=True, text=True, timeout=300, cwd=str(repo_path)
+            )
+            if result.returncode == 0:
+                return result.stdout
+        except Exception as e:
+            logger.warning(f"Diagnosis failed: {e}")
+        return None
+
+    def think_about_improvements(self, stats: Dict, repo_path: Path) -> List[Dict]:
+        """Analyze performance and suggest self-improvements."""
+        logs = self.get_recent_logs(500)
+        analysis = self.analyze_logs()
+
+        prompt = f'''You are the SelfAI system analyzing your own performance.
+
+CURRENT STATS:
+- Completed: {stats.get('completed', 0)}
+- Pending: {stats.get('pending', 0)}
+- Failed/Retried: {analysis.get('issues_found', 0)} issues
+
+RECENT PATTERNS IN LOGS:
+{logs[-2000:] if len(logs) > 2000 else logs}
+
+TASK:
+Based on your performance, suggest 2-3 specific improvements to make yourself better:
+1. What patterns do you see in failures?
+2. What could be optimized?
+3. What new capabilities would help?
+
+OUTPUT FORMAT (JSON):
+```json
+{{
+  "self_improvements": [
+    {{
+      "title": "Improvement title",
+      "description": "What to improve and why",
+      "priority": 1-100
+    }}
+  ]
+}}
+```'''
+
+        try:
+            result = subprocess.run(
+                [self.claude_cmd, '-p', prompt, '--allowedTools', 'Read', 'Glob'],
+                capture_output=True, text=True, timeout=300, cwd=str(repo_path)
+            )
+            if result.returncode == 0:
+                # Parse improvements
+                output = result.stdout
+                start = output.find('```json')
+                end = output.find('```', start + 7)
+                if start != -1 and end != -1:
+                    json_str = output[start + 7:end].strip()
+                    data = json.loads(json_str)
+                    return data.get('self_improvements', [])
+        except Exception as e:
+            logger.warning(f"Self-improvement analysis failed: {e}")
+        return []
+
+    def save_issues(self, issues: List[Dict]):
+        """Save issues to file for tracking."""
+        try:
+            existing = []
+            if self.issues_file.exists():
+                existing = json.loads(self.issues_file.read_text())
+            existing.extend(issues)
+            # Keep last 100 issues
+            self.issues_file.write_text(json.dumps(existing[-100:], indent=2))
+        except Exception:
+            pass
+
+    def save_improvements(self, improvements: List[Dict]):
+        """Save self-improvement suggestions."""
+        try:
+            existing = []
+            if self.improvements_file.exists():
+                existing = json.loads(self.improvements_file.read_text())
+            existing.extend(improvements)
+            self.improvements_file.write_text(json.dumps(existing[-50:], indent=2))
+        except Exception:
+            pass
+
+
 class Runner:
     """Autonomous self-improving runner with 3-level feature progression.
 
@@ -256,6 +419,7 @@ class Runner:
 
         self.db = Database(self.data_path / 'improvements.db')
         self.worktree_mgr = WorktreeManager(repo_path, self.workspace_path)
+        self.log_analyzer = LogAnalyzer(self.logs_path, self.CLAUDE_CMD)
         self._setup_logging()
         self._ensure_git_repo()
 
@@ -328,6 +492,12 @@ class Runner:
         tasks_processed = 0
 
         try:
+            # Log analysis BEFORE starting tasks
+            pre_analysis = self.log_analyzer.analyze_logs()
+            if pre_analysis['issues_found'] > 0:
+                logger.info(f"Pre-run log check: {pre_analysis['issues_found']} issues found")
+                self.log_analyzer.save_issues(pre_analysis['issues'])
+
             stats = self.db.get_stats()
 
             # Phase 0: If no features exist, analyze existing codebase first
@@ -362,6 +532,13 @@ class Runner:
             if stats.get('completed', 0) > 0 and stats.get('pending', 0) == 0 and stats.get('testing', 0) == 0:
                 logger.info("All existing features tested - discovering new improvements...")
                 self._run_discovery()
+
+            # Log analysis AFTER completing tasks
+            post_analysis = self.log_analyzer.analyze_logs()
+            if post_analysis['issues_found'] > pre_analysis['issues_found']:
+                new_issues = post_analysis['issues_found'] - pre_analysis['issues_found']
+                logger.warning(f"Post-run log check: {new_issues} new issues detected")
+                self.log_analyzer.save_issues(post_analysis['issues'])
 
             logger.info(f"Run completed: {tasks_processed} tasks in {self._format_duration(time.time() - start_time)}")
 
