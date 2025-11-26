@@ -42,7 +42,7 @@ def install_launchagent():
     <array>
         <string>{python_path}</string>
         <string>-m</string>
-        <string>_selfai</string>
+        <string>selfai</string>
         <string>run</string>
     </array>
     <key>WorkingDirectory</key>
