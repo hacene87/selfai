@@ -705,15 +705,22 @@ class Runner:
         imp_id = improvement['id']
         title = improvement['title']
         level = improvement['current_level']
+        level_col = LEVEL_NAMES[level].lower()
 
         # Run tests (in main repo for testing)
         self._run_tests(improvement)
 
-        # Check if test passed
-        updated = self.db.get_by_id(imp_id) if hasattr(self.db, 'get_by_id') else None
-        test_status = improvement.get(f'{LEVEL_NAMES[level].lower()}_test_status', 'pending')
+        # Check if test passed - get fresh data from database
+        updated = self.db.get_by_id(imp_id)
+        if not updated:
+            logger.warning(f"Could not find feature #{imp_id} in database after test")
+            self.worktree_mgr.cleanup_worktree(imp_id)
+            return
 
-        if test_status == 'passed' or (updated and updated.get('status') == 'completed'):
+        test_status = updated.get(f'{level_col}_test_status', 'pending')
+        is_completed = updated.get('status') == 'completed'
+
+        if test_status == 'passed' or is_completed:
             # Try to merge to main
             success, msg = self.worktree_mgr.merge_to_main(imp_id, title)
             if success:

@@ -308,3 +308,11 @@ class Database:
             cursor = conn.execute(
                 "SELECT title FROM improvements WHERE mvp_test_status = 'passed'")
             return [row[0] for row in cursor.fetchall()]
+
+    def get_by_id(self, imp_id: int) -> Optional[Dict]:
+        """Get a single improvement by ID."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute('SELECT * FROM improvements WHERE id = ?', (imp_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
