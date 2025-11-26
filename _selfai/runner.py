@@ -823,7 +823,7 @@ OUTPUT FORMAT:
 
 Remember: Your goal is to make this feature WORK, not just test it!'''
 
-        result = self._execute_claude(test_prompt, timeout=300)
+        result = self._execute_claude(test_prompt, timeout=3600)  # 1 hour timeout
 
         if result['success']:
             output = result.get('output', '')
@@ -1228,12 +1228,12 @@ INSTRUCTIONS:
 
 Execute now.'''
 
-        result = self._execute_claude(prompt, timeout=900, work_dir=exec_path)
+        result = self._execute_claude(prompt, timeout=3600, work_dir=exec_path)  # 1 hour timeout
         if result['success']:
             return result.get('output', '')
         return None
 
-    def _execute_claude(self, prompt: str, timeout: int = 300, work_dir: Path = None) -> Dict:
+    def _execute_claude(self, prompt: str, timeout: int = 3600, work_dir: Path = None) -> Dict:
         """Execute Claude CLI command in specified directory."""
         exec_path = work_dir or self.repo_path
         try:
@@ -1263,11 +1263,34 @@ Execute now.'''
         secs = int(seconds % 60)
         return f"{minutes}m {secs}s"
 
+    def _get_level_progress_indicator(self, imp: dict, level: int) -> str:
+        """Generate visual progress indicator for current level (Plan → Execute → Test)."""
+        level_prefix = {1: 'mvp', 2: 'enhanced', 3: 'advanced'}.get(level, 'mvp')
+
+        # Check what's completed at this level
+        has_plan = imp.get(f'{level_prefix}_plan') is not None
+        has_output = imp.get(f'{level_prefix}_output') is not None
+        test_status = imp.get(f'{level_prefix}_test_status', 'pending')
+
+        # Build progress indicator based on workflow stage
+        # ○ = pending, ● = completed/in-progress, ✓ = passed, ✗ = failed
+        plan_icon = '●' if has_plan else '○'
+        exec_icon = '●' if has_output else '○'
+
+        if test_status == 'passed':
+            test_icon = '✓'
+        elif test_status == 'failed':
+            test_icon = '✗'
+        else:
+            test_icon = '○'
+
+        return f'<span class="level-progress">{plan_icon} → {exec_icon} → {test_icon}</span>'
+
     def update_dashboard(self):
         """Update HTML dashboard with parallel processing info."""
         stats = self.db.get_stats()
         level_stats = self.db.get_level_stats()
-        improvements = self.db.get_all()
+        improvements = self.db.get_tasks_with_time_estimates()
 
         # Get active worktrees for parallel task tracking
         active_worktrees = self.worktree_mgr.get_active_worktrees()
@@ -1318,6 +1341,14 @@ Execute now.'''
             elif mvp_test == 'passed':
                 completed_level = "MVP"
 
+            # Current level progress indicator (Plan → Execute → Test)
+            level_progress = self._get_level_progress_indicator(imp, level)
+
+            # Estimated time remaining
+            est_remaining = "–"
+            if imp.get('estimated_remaining') is not None:
+                est_remaining = self._format_duration(imp['estimated_remaining'])
+
             # Check if running in parallel worktree
             is_parallel = imp['id'] in active_ids
             parallel_indicator = '⚡' if is_parallel else ''
@@ -1327,9 +1358,10 @@ Execute now.'''
             <tr class="{status_class}{' parallel' if is_parallel else ''}">
                 <td>{imp['id']}</td>
                 <td>{parallel_indicator} {html.escape(imp['title'])}</td>
-                <td><span class="level-badge level-{level}">{level_name}</span></td>
+                <td><span class="level-badge level-{level}">{level_name}</span> {level_progress}</td>
                 <td class="progress-cell">{progress}</td>
                 <td>{completed_level}</td>
+                <td>{est_remaining}</td>
                 <td><span class="status-badge {status_class}">{status}</span></td>
                 <td>{imp['priority']}</td>
             </tr>''')
@@ -1450,12 +1482,13 @@ Execute now.'''
                     <th>Working On</th>
                     <th>Tests (M|E|A)</th>
                     <th>Completed At</th>
+                    <th>Est. Time Remaining</th>
                     <th>Status</th>
                     <th>Priority</th>
                 </tr>
             </thead>
             <tbody>
-                {''.join(rows) if rows else '<tr><td colspan="7" style="text-align:center;color:#888;">No improvements yet</td></tr>'}
+                {''.join(rows) if rows else '<tr><td colspan="8" style="text-align:center;color:#888;">No improvements yet</td></tr>'}
             </tbody>
         </table>
     </div>

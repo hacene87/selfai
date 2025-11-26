@@ -17,12 +17,15 @@ class Database:
 
     def __init__(self, db_path: Path):
         self.db_path = db_path
+        # Ensure parent directory exists
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
     def _init_db(self):
         """Initialize database schema for 3-level progression."""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute('''
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute('''
                 CREATE TABLE IF NOT EXISTS improvements (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     title TEXT NOT NULL,
@@ -61,15 +64,20 @@ class Database:
                     enhanced_completed_at TEXT,
                     advanced_completed_at TEXT,
 
+                    -- Durations in seconds
+                    mvp_duration INTEGER,
+                    enhanced_duration INTEGER,
+                    advanced_duration INTEGER,
+
                     -- Error tracking
                     error TEXT,
                     retry_count INTEGER DEFAULT 0,
                     started_at TEXT
                 )
-            ''')
+                ''')
 
-            # Migrations for existing databases
-            migrations = [
+                # Migrations for existing databases
+                migrations = [
                 'ALTER TABLE improvements ADD COLUMN current_level INTEGER DEFAULT 1',
                 'ALTER TABLE improvements ADD COLUMN mvp_plan TEXT',
                 'ALTER TABLE improvements ADD COLUMN enhanced_plan TEXT',
@@ -86,17 +94,23 @@ class Database:
                 'ALTER TABLE improvements ADD COLUMN mvp_completed_at TEXT',
                 'ALTER TABLE improvements ADD COLUMN enhanced_completed_at TEXT',
                 'ALTER TABLE improvements ADD COLUMN advanced_completed_at TEXT',
-            ]
-            for migration in migrations:
-                try:
-                    conn.execute(migration)
-                except sqlite3.OperationalError:
-                    pass
+                'ALTER TABLE improvements ADD COLUMN mvp_duration INTEGER',
+                'ALTER TABLE improvements ADD COLUMN enhanced_duration INTEGER',
+                'ALTER TABLE improvements ADD COLUMN advanced_duration INTEGER',
+                ]
+                for migration in migrations:
+                    try:
+                        conn.execute(migration)
+                    except sqlite3.OperationalError:
+                        pass
 
-            conn.execute('CREATE INDEX IF NOT EXISTS idx_status ON improvements(status)')
-            conn.execute('CREATE INDEX IF NOT EXISTS idx_priority ON improvements(priority)')
-            conn.execute('CREATE INDEX IF NOT EXISTS idx_current_level ON improvements(current_level)')
-            conn.commit()
+                conn.execute('CREATE INDEX IF NOT EXISTS idx_status ON improvements(status)')
+                conn.execute('CREATE INDEX IF NOT EXISTS idx_priority ON improvements(priority)')
+                conn.execute('CREATE INDEX IF NOT EXISTS idx_current_level ON improvements(current_level)')
+                conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"Database connection failed: {e}")
+            raise RuntimeError(f"Failed to initialize database at {self.db_path}: {e}") from e
 
     def add(self, title: str, description: str, category: str = 'general',
             priority: int = 50, source: str = 'ai_discovered') -> int:
@@ -164,13 +178,25 @@ class Database:
         """Mark current level as completed, move to testing."""
         level_col = {1: 'mvp', 2: 'enhanced', 3: 'advanced'}[level]
         with sqlite3.connect(self.db_path) as conn:
+            # Get started_at to calculate duration
+            cursor = conn.execute('SELECT started_at FROM improvements WHERE id = ?', (imp_id,))
+            row = cursor.fetchone()
+            duration = None
+            if row and row[0]:
+                try:
+                    started_at = datetime.fromisoformat(row[0])
+                    duration = int((datetime.now() - started_at).total_seconds())
+                except (ValueError, AttributeError):
+                    pass
+
             conn.execute(f'''
                 UPDATE improvements
                 SET status = 'testing',
                     {level_col}_output = ?,
-                    {level_col}_completed_at = ?
+                    {level_col}_completed_at = ?,
+                    {level_col}_duration = ?
                 WHERE id = ?
-            ''', (output, datetime.now().isoformat(), imp_id))
+            ''', (output, datetime.now().isoformat(), duration, imp_id))
             conn.commit()
             return True
 
@@ -235,11 +261,11 @@ class Database:
             return True
 
     def mark_failed(self, imp_id: int, error: str) -> bool:
-        """Mark improvement as failed."""
+        """Mark improvement as failed, set back to pending for retry."""
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('''
                 UPDATE improvements
-                SET status = 'failed', error = ?, retry_count = retry_count + 1
+                SET status = 'pending', error = ?, retry_count = retry_count + 1
                 WHERE id = ?
             ''', (error, imp_id))
             conn.commit()
@@ -295,6 +321,50 @@ class Database:
                     f"SELECT COUNT(*) FROM improvements WHERE {level_col}_test_status = 'passed'")
                 stats[level]['passed'] = cursor.fetchone()[0]
             return stats
+
+    def get_average_duration_by_level(self) -> Dict[int, Optional[float]]:
+        """Get average duration in seconds for each level from completed tasks."""
+        with sqlite3.connect(self.db_path) as conn:
+            averages = {}
+            for level in [1, 2, 3]:
+                level_col = {1: 'mvp', 2: 'enhanced', 3: 'advanced'}[level]
+                cursor = conn.execute(
+                    f"SELECT AVG({level_col}_duration) FROM improvements WHERE {level_col}_duration IS NOT NULL")
+                result = cursor.fetchone()[0]
+                averages[level] = result if result else None
+            return averages
+
+    def get_tasks_with_time_estimates(self) -> List[Dict]:
+        """Get all tasks with estimated time remaining for in-progress tasks.
+
+        Returns list of tasks with additional 'estimated_remaining' field (in seconds) for active tasks.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute('SELECT * FROM improvements ORDER BY id DESC')
+            tasks = [dict(row) for row in cursor.fetchall()]
+
+            # Get average durations
+            averages = self.get_average_duration_by_level()
+
+            # Calculate estimated remaining time for in-progress tasks
+            now = datetime.now()
+            for task in tasks:
+                task['estimated_remaining'] = None
+                if task['status'] in ('in_progress', 'testing') and task['started_at']:
+                    try:
+                        started_at = datetime.fromisoformat(task['started_at'])
+                        elapsed = (now - started_at).total_seconds()
+                        level = task['current_level']
+                        avg_duration = averages.get(level)
+
+                        if avg_duration:
+                            remaining = avg_duration - elapsed
+                            task['estimated_remaining'] = max(0, remaining)  # Don't show negative
+                    except (ValueError, AttributeError):
+                        pass
+
+            return tasks
 
     def exists(self, title: str) -> bool:
         """Check if improvement with title already exists."""
