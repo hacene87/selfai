@@ -1,0 +1,37 @@
+[
+  {
+    "type": "error",
+    "detail": " Database connection failed - retrying",
+    "timestamp": "2025-11-26T22:52:54.816192"
+  },
+  {
+    "type": "exception",
+    "detail": " FileNotFoundError in module loader",
+    "timestamp": "2025-11-26T22:52:54.816199"
+  },
+  {
+    "type": "failure",
+    "detail": " parse JSON response",
+    "timestamp": "2025-11-26T22:52:54.816211"
+  },
+  {
+    "type": "timeout",
+    "detail": "Timeout",
+    "timestamp": "2025-11-26T22:52:54.816218"
+  },
+  {
+    "type": "conflict",
+    "detail": "CONFLICT",
+    "timestamp": "2025-11-26T22:52:54.816224"
+  },
+  {
+    "type": "conflict",
+    "detail": "conflict",
+    "timestamp": "2025-11-26T22:52:54.816225"
+  },
+  {
+    "type": "conflict",
+    "detail": "conflict",
+    "timestamp": "2025-11-26T22:52:54.816226"
+  }
+]
