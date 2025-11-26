@@ -12,7 +12,7 @@ def get_repo_root() -> Path:
     """Get the repository root (parent of .selfai folder)."""
     # Use current working directory to respect LaunchAgent's WorkingDirectory
     cwd = Path.cwd()
-    if (cwd / '_selfai').exists():
+    if (cwd / 'selfai').exists():
         return cwd
     # Fall back to __file__ location for direct execution
     return Path(__file__).parent.parent.resolve()
@@ -42,7 +42,7 @@ def install_launchagent():
     <array>
         <string>{python_path}</string>
         <string>-m</string>
-        <string>_selfai</string>
+        <string>selfai</string>
         <string>run</string>
     </array>
     <key>WorkingDirectory</key>
