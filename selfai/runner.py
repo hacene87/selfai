@@ -390,25 +390,32 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
             'cancelled': '#dc2626',
         }
 
-        # Generate task rows
+        # Generate task rows and plan data for JavaScript
         rows = []
+        plans_data = {}
         for task in tasks:
             status = task.get('status', 'pending')
             color = status_colors.get(status, '#6b7280')
 
-            # Plan preview (first 100 chars)
+            # Plan content
             plan = task.get('plan_content', '') or ''
-            plan_preview = plan[:150].replace('"', '&quot;').replace('<', '&lt;').replace('\n', ' ')
+            plan_preview = plan[:100].replace('"', '&quot;').replace('<', '&lt;').replace('\n', ' ')
+
+            # Store plan data for JavaScript
+            if plan:
+                plans_data[task['id']] = plan.replace('\\', '\\\\').replace('`', '\\`').replace('${', '\\${')
 
             # Action buttons based on status
             actions = ''
+            if plan:
+                actions += f'''<button onclick="showPlan({task['id']})" class="btn-view">View Plan</button>'''
             if status == 'plan_review':
-                actions = f'''
+                actions += f'''
                     <button onclick="approvePlan({task['id']})" class="btn-approve">Approve</button>
                     <button onclick="showFeedback({task['id']})" class="btn-feedback">Feedback</button>
                 '''
             elif status == 'cancelled':
-                actions = f'''
+                actions += f'''
                     <button onclick="reEnable({task['id']})" class="btn-reenable">Re-enable</button>
                 '''
 
@@ -419,7 +426,7 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
                 <td>{task['id']}</td>
                 <td>{task['title']}</td>
                 <td><span class="status-badge" style="background: {color}20; color: {color}">{status}</span></td>
-                <td class="plan-cell" title="{plan_preview}">{plan_preview[:50]}{'...' if len(plan_preview) > 50 else ''}</td>
+                <td class="plan-cell">{plan_preview[:50]}{'...' if len(plan_preview) > 50 else '' if plan else '<em>Pending</em>'}</td>
                 <td>{test_info}</td>
                 <td>{actions}</td>
             </tr>
@@ -487,7 +494,7 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
             color: #888;
             font-size: 0.85rem;
         }}
-        .btn-approve, .btn-feedback, .btn-reenable {{
+        .btn-approve, .btn-feedback, .btn-reenable, .btn-view {{
             padding: 5px 10px;
             border: none;
             border-radius: 5px;
@@ -498,6 +505,7 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
         .btn-approve {{ background: #22c55e; color: white; }}
         .btn-feedback {{ background: #f59e0b; color: white; }}
         .btn-reenable {{ background: #6366f1; color: white; }}
+        .btn-view {{ background: #3b82f6; color: white; }}
         tr.plan_review {{ background: rgba(245, 158, 11, 0.1); }}
         tr.cancelled {{ background: rgba(220, 38, 38, 0.1); opacity: 0.7; }}
         tr.completed {{ opacity: 0.6; }}
@@ -520,6 +528,22 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
             border-radius: 15px;
             max-width: 600px;
             width: 90%;
+        }}
+        .modal-content.wide {{
+            max-width: 90%;
+            max-height: 90vh;
+            overflow-y: auto;
+        }}
+        .plan-content {{
+            background: #16213e;
+            padding: 20px;
+            border-radius: 8px;
+            white-space: pre-wrap;
+            font-family: monospace;
+            font-size: 0.85rem;
+            max-height: 60vh;
+            overflow-y: auto;
+            line-height: 1.5;
         }}
         .modal textarea {{
             width: 100%;
@@ -598,8 +622,33 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
         </div>
     </div>
 
+    <!-- Plan Modal -->
+    <div id="planModal" class="modal">
+        <div class="modal-content wide">
+            <h3 id="planTitle">Plan Details</h3>
+            <div id="planContent" class="plan-content"></div>
+            <div style="margin-top: 15px; text-align: right;">
+                <button onclick="closePlanModal()" style="background: #6b7280; color: white;">Close</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         let currentTaskId = null;
+        const plans = {json.dumps(plans_data)};
+
+        function showPlan(id) {{
+            const plan = plans[id];
+            if (plan) {{
+                document.getElementById('planTitle').textContent = 'Plan for Task #' + id;
+                document.getElementById('planContent').textContent = plan;
+                document.getElementById('planModal').style.display = 'flex';
+            }}
+        }}
+
+        function closePlanModal() {{
+            document.getElementById('planModal').style.display = 'none';
+        }}
 
         function approvePlan(id) {{
             if (confirm('Approve this plan for execution?')) {{
