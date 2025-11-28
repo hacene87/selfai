@@ -1532,15 +1532,24 @@ SUCCESS = Feature is production-ready with full coverage"""
             success, msg = self.worktree_mgr.merge_to_main(imp_id, title)
             if success:
                 logger.info(f"✓ Merged feature #{imp_id} to main: {title}")
-                # Cleanup worktree only after successful merge
-                self.worktree_mgr.cleanup_worktree(imp_id)
+                # Only cleanup worktree after Advanced (level 3) is completed and merged
+                # Keep worktree for MVP and Enhanced to reuse for next level
+                advanced_passed = updated.get('advanced_test_status') == 'passed'
+                if advanced_passed and updated.get('current_level', 1) >= 3:
+                    logger.info(f"Feature #{imp_id} completed all 3 levels - cleaning up worktree")
+                    self.worktree_mgr.cleanup_worktree(imp_id)
+                else:
+                    logger.debug(f"Keeping worktree for #{imp_id} - not yet at Advanced level")
             elif 'CONFLICT' in msg:
                 # Try to resolve conflicts
                 logger.warning(f"Conflicts in #{imp_id}, attempting resolution...")
                 if self.worktree_mgr.resolve_conflicts(self.CLAUDE_CMD, title):
                     logger.info(f"✓ Resolved conflicts and merged #{imp_id}")
-                    # Cleanup after conflict resolution and merge
-                    self.worktree_mgr.cleanup_worktree(imp_id)
+                    # Only cleanup after Advanced level
+                    advanced_passed = updated.get('advanced_test_status') == 'passed'
+                    if advanced_passed and updated.get('current_level', 1) >= 3:
+                        logger.info(f"Feature #{imp_id} completed all 3 levels after conflict resolution - cleaning up worktree")
+                        self.worktree_mgr.cleanup_worktree(imp_id)
                 else:
                     logger.error(f"✗ Could not resolve conflicts for #{imp_id}")
                     # Keep worktree for manual inspection
