@@ -16,6 +16,7 @@ import logging
 import shutil
 import fcntl
 import re
+import psutil
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
@@ -405,16 +406,47 @@ class SelfAIRunner:
         logger.setLevel(logging.INFO)
 
     def acquire_lock(self) -> bool:
-        """Acquire exclusive lock."""
+        """Acquire exclusive lock with stale lock detection."""
         try:
+            # Check if lock file exists
+            if self.lock_file.exists():
+                # Read existing PID
+                try:
+                    existing_pid = int(self.lock_file.read_text().strip())
+                    if self._is_process_running(existing_pid):
+                        logger.info(f"Another instance (PID {existing_pid}) is running")
+                        return False
+                    else:
+                        logger.warning(f"Detected stale lock from PID {existing_pid}, cleaning up")
+                        self.lock_file.unlink(missing_ok=True)
+                except (ValueError, OSError) as e:
+                    logger.warning(f"Invalid lock file, removing: {e}")
+                    self.lock_file.unlink(missing_ok=True)
+
+            # Acquire lock
             self.lock_fd = open(self.lock_file, 'w')
             fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.lock_fd.write(str(os.getpid()))
             self.lock_fd.flush()
+            logger.info(f"Lock acquired by PID {os.getpid()}")
             return True
-        except (IOError, OSError):
+        except (IOError, OSError) as e:
             if self.lock_fd:
                 self.lock_fd.close()
+            logger.info(f"Failed to acquire lock: {e}")
+            return False
+
+    def _is_process_running(self, pid: int) -> bool:
+        """Check if a process is actually running (not zombie/dead)."""
+        try:
+            process = psutil.Process(pid)
+            # Check process exists and is not dead/zombie
+            if psutil.pid_exists(pid) and process.status() not in (
+                psutil.STATUS_DEAD, psutil.STATUS_ZOMBIE
+            ):
+                return True
+            return False
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error):
             return False
 
     def release_lock(self):
@@ -468,7 +500,13 @@ class SelfAIRunner:
         return added_count
 
     def run(self, discover: bool = False):
-        """Main run loop.
+        """Main run loop with smart task resumption and priority system.
+
+        Phase ordering (priority):
+        1. Resume stuck in-progress tasks (from crashed processes) - HIGHEST PRIORITY
+        2. Test tasks that need testing (complete pending work)
+        3. Execute approved tasks
+        4. Generate plans for pending tasks (by priority)
 
         Args:
             discover: If True, run improvement discovery before other phases
@@ -496,51 +534,43 @@ class SelfAIRunner:
                 discovered = self._discover_existing_features()
                 logger.info(f"Phase 0: Discovered {discovered} new improvements")
 
-            # Check and update level unlocks
-            self.db.check_and_unlock_levels()
+            # Process tasks (single level workflow)
+            level = 1
 
-            # Get unlock status for logging
-            _, enhanced_msg = self.db.is_level_unlocked(2)
-            _, advanced_msg = self.db.is_level_unlocked(3)
-            logger.info(f"Level Status: Enhanced={enhanced_msg}, Advanced={advanced_msg}")
+            # PHASE 1: Resume stuck in-progress tasks (HIGHEST PRIORITY)
+            # These may be from crashed processes
+            stuck_tasks = self.db.get_stuck_in_progress_tasks(limit=MAX_PARALLEL_TASKS)
+            if stuck_tasks:
+                logger.warning(f"Phase 1: Resuming {len(stuck_tasks)} stuck in-progress tasks...")
+                for task in stuck_tasks:
+                    logger.info(f"Resuming stuck task #{task['id']}: {task['title']} (started at {task.get('started_at')})")
+                self._execute_parallel(stuck_tasks)
+                tasks_processed += len(stuck_tasks)
 
-            # Process each level in order (MVP -> Enhanced -> Advanced)
-            for level in [1, 2, 3]:
-                unlocked, _ = self.db.is_level_unlocked(level)
-                if not unlocked:
-                    continue
+            # PHASE 2: Test tasks that need testing
+            testing = self.db.get_features_for_testing_at_level(level, limit=MAX_PARALLEL_TASKS)
+            if testing:
+                logger.info(f"Phase 2: Testing {len(testing)} tasks...")
+                for task in testing:
+                    self._run_test(task, level)
+                    tasks_processed += 1
 
-                level_name = LEVEL_GUIDANCE[level]['name']
+            # PHASE 3: Execute approved tasks
+            approved = self.db.get_features_for_level(level, limit=MAX_PARALLEL_TASKS)
+            if approved:
+                logger.info(f"Phase 3: Executing {len(approved)} approved tasks...")
+                self._execute_parallel(approved)
+                tasks_processed += len(approved)
 
-                # Phase 1: Plan features at this level
-                pending = self.db.get_pending_planning_for_level(level, limit=MAX_PARALLEL_TASKS)
-                if pending:
-                    logger.info(f"Planning {len(pending)} {level_name} tasks...")
-                    for task in pending:
-                        if self.db.can_start_new_task():
-                            self._generate_plan(task)
-                            tasks_processed += 1
-
-                # Phase 2: Execute approved features at this level
-                approved = self.db.get_features_for_level(level, limit=MAX_PARALLEL_TASKS)
-                if approved:
-                    logger.info(f"Executing {len(approved)} {level_name} tasks...")
-                    self._execute_parallel(approved)
-                    tasks_processed += len(approved)
-
-                # Phase 3: Test features at this level
-                testing = self.db.get_features_for_testing_at_level(level, limit=MAX_PARALLEL_TASKS)
-                if testing:
-                    logger.info(f"Testing {len(testing)} {level_name} tasks...")
-                    for task in testing:
-                        self._run_test(task, level)
+            # PHASE 4: Generate plans for pending tasks (BY PRIORITY)
+            pending = self.db.get_pending_planning_for_level(level, limit=MAX_PARALLEL_TASKS)
+            if pending:
+                logger.info(f"Phase 4: Planning {len(pending)} tasks (by priority)...")
+                for task in pending:
+                    logger.info(f"Planning task #{task['id']} (priority: {task.get('priority', 50)}): {task['title']}")
+                    if self.db.can_start_new_task():
+                        self._generate_plan(task)
                         tasks_processed += 1
-
-            # Phase 4: Resume in-progress tasks
-            in_progress = self.db.get_in_progress(limit=MAX_PARALLEL_TASKS)
-            if in_progress:
-                logger.info(f"Phase 4: Resuming {len(in_progress)} in-progress tasks...")
-                self._execute_parallel(in_progress)
 
             # Phase 5: Log analysis and self-diagnosis
             logger.info("Phase 5: Running log analysis...")
@@ -1105,7 +1135,7 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
         # Write dashboard
         dashboard_path = self.data_dir / 'dashboard.html'
         dashboard_path.write_text(html)
-        logger.info(f"Dashboard updated: {stats}")
+        logger.debug(f"Dashboard updated: {stats}")
 
     def _generate_discovery_stats_html(self, discovery_stats: Dict) -> str:
         """Generate discovery statistics HTML section."""
@@ -1148,12 +1178,16 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
         enhanced_unlocked, enhanced_msg = self.db.is_level_unlocked(2)
         advanced_unlocked, advanced_msg = self.db.is_level_unlocked(3)
 
+        # Get recovery stats
+        recovery_stats = self.db.get_recovery_stats()
+        stuck_count = recovery_stats.get('stuck_count', 0)
+
         # Status colors
         status_colors = {
             'pending': '#6b7280',
             'planning': '#8b5cf6',
             'plan_review': '#f59e0b',
-            'approved': '#10b981',
+            'approved': '#06b6d4',  # Cyan - ready for execution
             'in_progress': '#3b82f6',
             'testing': '#6366f1',
             'completed': '#22c55e',
@@ -1204,12 +1238,7 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
             actions = ''
             if plan:
                 actions += f'''<button onclick="showPlan({task['id']})" class="btn-view">View Plan</button>'''
-            if status == 'plan_review':
-                actions += f'''
-                    <button onclick="approvePlan({task['id']})" class="btn-approve">Approve</button>
-                    <button onclick="showFeedback({task['id']})" class="btn-feedback">Feedback</button>
-                '''
-            elif status == 'cancelled':
+            if status == 'cancelled':
                 actions += f'''
                     <button onclick="reEnable({task['id']})" class="btn-reenable">Re-enable</button>
                 '''
@@ -1357,43 +1386,6 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
             border-radius: 8px;
             cursor: pointer;
         }}
-        .unlock-status {{
-            display: flex;
-            gap: 15px;
-            justify-content: center;
-            margin-bottom: 20px;
-        }}
-        .unlock-card {{
-            background: rgba(255,255,255,0.1);
-            padding: 15px 20px;
-            border-radius: 10px;
-            text-align: center;
-            min-width: 150px;
-        }}
-        .unlock-card.unlocked {{
-            background: rgba(34, 197, 94, 0.2);
-            border: 2px solid #22c55e;
-        }}
-        .unlock-card.locked {{
-            background: rgba(156, 163, 175, 0.1);
-            border: 2px solid #6b7280;
-            opacity: 0.6;
-        }}
-        .level-icon {{
-            font-size: 2rem;
-            font-weight: bold;
-            display: block;
-        }}
-        .level-name {{
-            font-size: 0.9rem;
-            font-weight: 600;
-            display: block;
-            margin: 5px 0;
-        }}
-        .unlock-card .status {{
-            font-size: 0.75rem;
-            color: #888;
-        }}
     </style>
 </head>
 <body>
@@ -1403,23 +1395,9 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
             Planning-First Workflow | Max {MAX_PARALLEL_TASKS} Parallel | {MAX_TEST_ATTEMPTS} Test Attempts
         </p>
 
-        <div class="unlock-status">
-            <div class="unlock-card unlocked">
-                <span class="level-icon">1</span>
-                <span class="level-name">MVP</span>
-                <span class="status">✓ Unlocked</span>
-            </div>
-            <div class="unlock-card {'unlocked' if enhanced_unlocked else 'locked'}">
-                <span class="level-icon">2</span>
-                <span class="level-name">Enhanced</span>
-                <span class="status">{enhanced_msg}</span>
-            </div>
-            <div class="unlock-card {'unlocked' if advanced_unlocked else 'locked'}">
-                <span class="level-icon">3</span>
-                <span class="level-name">Advanced</span>
-                <span class="status">{advanced_msg}</span>
-            </div>
-        </div>
+        {'<div class="warning-banner" style="background: rgba(245, 158, 11, 0.2); padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #f59e0b;">' +
+         f'⚠️ <strong>{stuck_count} stuck in-progress task(s)</strong> detected (may be from crashed processes)' +
+         '<br><small>Will be resumed on next run</small></div>' if stuck_count > 0 else ''}
 
         <div class="stats">
             <div class="stat-card">
@@ -1441,6 +1419,10 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
             <div class="stat-card">
                 <div class="value" style="color: #dc2626">{stats.get('cancelled', 0)}</div>
                 <div class="label">Cancelled</div>
+            </div>
+            <div class="stat-card">
+                <div class="value" style="color: #f59e0b">{stuck_count}</div>
+                <div class="label">Stuck Tasks</div>
             </div>
         </div>
 

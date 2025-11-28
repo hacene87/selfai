@@ -288,6 +288,22 @@ class Database:
             ''', (limit,))
             return [dict(row) for row in cursor.fetchall()]
 
+    def get_stuck_in_progress_tasks(self, limit: int = MAX_PARALLEL_TASKS) -> List[Dict]:
+        """Get in-progress tasks that may have crashed (oldest first by started_at).
+
+        These are tasks marked as in_progress but no active runner is processing them.
+        Order by started_at ASC to process oldest stuck tasks first.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute('''
+                SELECT * FROM improvements
+                WHERE status = 'in_progress'
+                ORDER BY started_at ASC
+                LIMIT ?
+            ''', (limit,))
+            return [dict(row) for row in cursor.fetchall()]
+
     def get_plan_review_tasks(self) -> List[Dict]:
         """Get tasks waiting for plan review/approval."""
         with sqlite3.connect(self.db_path) as conn:
@@ -316,16 +332,22 @@ class Database:
         return self._update_status(imp_id, 'planning')
 
     def save_plan(self, imp_id: int, plan_content: str, optimized_plan: str = '') -> bool:
-        """Save the generated plan and move to review status."""
+        """Save the generated plan and auto-approve for execution."""
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute('''
+            # Get current level to set the right level status
+            cursor = conn.execute('SELECT current_level FROM improvements WHERE id = ?', (imp_id,))
+            row = cursor.fetchone()
+            level = row[0] if row else 1
+            level_status_col = {1: 'mvp_status', 2: 'enhanced_status', 3: 'advanced_status'}.get(level, 'mvp_status')
+
+            conn.execute(f'''
                 UPDATE improvements
-                SET plan_content = ?, plan_status = 'reviewing', status = 'plan_review',
-                    optimized_plan = ?
+                SET plan_content = ?, plan_status = 'approved', status = 'approved',
+                    optimized_plan = ?, {level_status_col} = 'approved'
                 WHERE id = ?
             ''', (plan_content, optimized_plan, imp_id))
             conn.commit()
-            logger.info(f"Plan saved for #{imp_id}, awaiting review")
+            logger.info(f"Plan saved and auto-approved for #{imp_id}")
             return True
 
     def update_optimized_plan(self, imp_id: int, optimized_plan: str) -> bool:
@@ -366,6 +388,14 @@ class Database:
     def mark_in_progress(self, imp_id: int) -> bool:
         """Mark task as in progress (being implemented)."""
         with sqlite3.connect(self.db_path) as conn:
+            # Get current status to log transition
+            cursor = conn.execute('SELECT status, title FROM improvements WHERE id = ?', (imp_id,))
+            row = cursor.fetchone()
+            if row:
+                old_status = row[0]
+                title = row[1]
+                logger.info(f"Task #{imp_id} ({title}): {old_status} → in_progress")
+
             conn.execute('''
                 UPDATE improvements
                 SET status = 'in_progress', started_at = ?
@@ -723,11 +753,11 @@ class Database:
 
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
-            # Features at this level that are approved/ready
+            # Features at this level that are approved/ready (exclude already processing)
             cursor = conn.execute(f'''
                 SELECT * FROM improvements
                 WHERE current_level = ? AND {level_status_col} = 'approved'
-                AND status != 'cancelled'
+                AND status = 'approved'
                 ORDER BY priority DESC
                 LIMIT ?
             ''', (level, limit))
@@ -853,5 +883,28 @@ class Database:
                     'in_progress': in_progress,
                     'pending': pending
                 }
+
+            return stats
+
+    def get_recovery_stats(self) -> Dict:
+        """Get statistics about task recovery and lifecycle."""
+        with sqlite3.connect(self.db_path) as conn:
+            stats = {}
+
+            # Count stuck tasks
+            cursor = conn.execute("SELECT COUNT(*) FROM improvements WHERE status = 'in_progress'")
+            stats['stuck_count'] = cursor.fetchone()[0]
+
+            # Average time in each status
+            cursor = conn.execute('''
+                SELECT status,
+                       COUNT(*) as count,
+                       AVG(CAST((julianday('now') - julianday(started_at)) * 24 * 60 AS INTEGER)) as avg_minutes
+                FROM improvements
+                WHERE started_at IS NOT NULL
+                GROUP BY status
+            ''')
+            stats['status_duration'] = {row[0]: {'count': row[1], 'avg_minutes': row[2] or 0}
+                                         for row in cursor.fetchall()}
 
             return stats

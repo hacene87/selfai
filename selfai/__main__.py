@@ -113,6 +113,18 @@ def show_status():
         if count > 0:
             print(f"  {status}: {count}")
 
+    # Show stuck tasks
+    stuck_tasks = runner.db.get_stuck_in_progress_tasks(limit=10)
+    if stuck_tasks:
+        print(f"\n⚠️  Stuck In-Progress Tasks (may be from crashes):")
+        for task in stuck_tasks[:5]:
+            started_at = task.get('started_at', 'unknown')
+            print(f"  #{task['id']}: {task['title']}")
+            print(f"      Started: {started_at}")
+        if len(stuck_tasks) > 5:
+            print(f"  ... and {len(stuck_tasks) - 5} more")
+        print(f"\n  Will be resumed on next run")
+
     # Show plan_review tasks that need attention
     review_tasks = runner.db.get_plan_review_tasks()
     if review_tasks:
@@ -131,6 +143,27 @@ def show_status():
         for task in cancelled[:3]:
             print(f"  #{task['id']}: {task['title']}")
         print(f"\n  Use: python -m selfai reenable <id> [\"feedback\"]")
+
+
+def show_stuck_tasks():
+    """Show tasks that may be stuck from crashed processes."""
+    repo_path = get_repo_root()
+    runner = SelfAIRunner(repo_path)
+
+    stuck_tasks = runner.db.get_stuck_in_progress_tasks(limit=10)
+
+    if not stuck_tasks:
+        print("\nNo stuck tasks found")
+        return
+
+    print(f"\n=== Stuck In-Progress Tasks (may be from crashes) ===")
+    for task in stuck_tasks:
+        started_at = task.get('started_at', 'unknown')
+        print(f"  #{task['id']}: {task['title']}")
+        print(f"      Started: {started_at}")
+
+    print(f"\nThese tasks will be resumed on next run")
+    print(f"Or run: python -m selfai run")
 
 
 def open_dashboard():
@@ -494,6 +527,7 @@ Commands:
     discover [cats]  Discover improvements (categories: security, test_coverage,
                      refactoring, documentation, performance, code_quality)
     status           Show current status with tasks awaiting review
+    stuck            Show stuck in-progress tasks (may be from crashes)
     levels           Show 3-level progression status (MVP/Enhanced/Advanced)
     progress <id>    Show level progress for a specific feature
     monitor          Show self-healing monitoring statistics
@@ -563,6 +597,8 @@ def main():
         run_discovery(categories)
     elif command == 'status':
         show_status()
+    elif command == 'stuck':
+        show_stuck_tasks()
     elif command == 'dashboard':
         open_dashboard()
     elif command == 'serve':

@@ -8,6 +8,9 @@ version = "0.1.0"
 description = "Self-improving AI system with planning-first workflow"
 readme = "README.md"
 requires-python = ">=3.8"
+dependencies = [
+    "psutil>=5.9.0",
+]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
