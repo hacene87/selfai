@@ -6,6 +6,8 @@ import subprocess
 from pathlib import Path
 
 from .runner import SelfAIRunner
+from .server import run_server
+from .healers import KnowledgeBase
 
 
 def get_repo_root() -> Path:
@@ -131,28 +133,83 @@ def show_status():
 
 
 def open_dashboard():
-    """Open the dashboard in browser."""
-    repo_path = get_repo_root()
-    dashboard_path = repo_path / '.selfai_data' / 'dashboard.html'
+    """Open the dashboard in browser via server."""
+    import threading
+    import time
+    from http.server import HTTPServer
+    from .server import create_handler
 
+    repo_path = get_repo_root()
+
+    # Update dashboard first
     runner = SelfAIRunner(repo_path)
     runner.update_dashboard()
 
-    webbrowser.open(f'file://{dashboard_path}')
-    print(f"Opened dashboard: {dashboard_path}")
+    # Start server in background thread
+    handler = create_handler(repo_path)
+    server = HTTPServer(('localhost', 8787), handler)
+
+    def serve():
+        server.serve_forever()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+
+    # Give server time to start
+    time.sleep(0.5)
+
+    # Open browser
+    webbrowser.open('http://localhost:8787/')
+    print(f"Dashboard opened at http://localhost:8787/")
+    print("Press Ctrl+C to stop")
+
+    try:
+        # Keep main thread alive
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nServer stopped")
+        server.shutdown()
 
 
-def run_once():
+def serve_dashboard(port: int = 8787):
+    """Start the dashboard server."""
+    repo_path = get_repo_root()
+    print(f"Starting SelfAI Dashboard Server for: {repo_path}")
+    run_server(host='localhost', port=port, repo_path=repo_path)
+
+
+def run_once(discover: bool = False):
     """Run a single improvement cycle."""
     repo_path = get_repo_root()
     print(f"Running SelfAI for: {repo_path}")
 
     runner = SelfAIRunner(repo_path)
-    runner.run()
+    runner.run(discover=discover)
 
     stats = runner.db.get_stats()
     print(f"\nStatus: {stats.get('completed', 0)} completed, {stats.get('in_progress', 0)} in progress")
     print(f"        {stats.get('plan_review', 0)} awaiting review, {stats.get('pending', 0)} pending")
+
+
+def run_discovery(categories: list = None):
+    """Run improvement discovery scan."""
+    from .discovery import DiscoveryCategory
+
+    repo_path = get_repo_root()
+    runner = SelfAIRunner(repo_path)
+
+    print("\n🔍 Discovering improvements...")
+    if categories:
+        print(f"Categories: {', '.join(categories)}")
+    else:
+        print("Categories: all")
+
+    discovered = runner._discover_existing_features(categories)
+
+    runner.update_dashboard()
+    print(f"\n✅ Found {discovered} new improvements")
+    print("Run 'python -m selfai status' to see pending tasks")
 
 
 def add_improvement(title: str, description: str = ''):
@@ -265,9 +322,12 @@ Usage:
     python -m selfai <command> [options]
 
 Commands:
-    run              Run a single improvement cycle
+    run [--discover] Run a single improvement cycle (optionally with discovery)
+    discover [cats]  Discover improvements (categories: security, test_coverage,
+                     refactoring, documentation, performance, code_quality)
     status           Show current status with tasks awaiting review
-    dashboard        Open dashboard in browser
+    dashboard        Open dashboard in browser (starts server)
+    serve [port]     Start dashboard server only (default port: 8787)
     add "title"      Add a new improvement task
     approve <id>     Approve a plan for execution
     feedback <id> "msg"  Provide feedback to revise a plan
@@ -287,6 +347,9 @@ Workflow:
 
 Examples:
     python -m selfai run                     # Run once manually
+    python -m selfai run --discover          # Run with discovery phase
+    python -m selfai discover                # Discover all improvements
+    python -m selfai discover security       # Discover only security issues
     python -m selfai status                  # Check status
     python -m selfai add "Add dark mode"     # Add new task
     python -m selfai approve 5               # Approve plan #5
@@ -310,11 +373,34 @@ def main():
     elif command == 'uninstall':
         uninstall_launchagent()
     elif command == 'run':
-        run_once()
+        # Check for --discover flag
+        discover = '--discover' in sys.argv
+        run_once(discover=discover)
+    elif command == 'discover':
+        # Get optional categories from remaining args
+        categories = sys.argv[2:] if len(sys.argv) > 2 else None
+        if categories:
+            # Validate categories
+            valid_cats = ['security', 'test_coverage', 'refactoring', 'documentation', 'performance', 'code_quality']
+            invalid = [c for c in categories if c not in valid_cats]
+            if invalid:
+                print(f"Error: Invalid categories: {', '.join(invalid)}")
+                print(f"Valid categories: {', '.join(valid_cats)}")
+                return
+        run_discovery(categories)
     elif command == 'status':
         show_status()
     elif command == 'dashboard':
         open_dashboard()
+    elif command == 'serve':
+        port = 8787
+        if len(sys.argv) > 2:
+            try:
+                port = int(sys.argv[2])
+            except ValueError:
+                print("Error: port must be a number")
+                return
+        serve_dashboard(port)
     elif command == 'add':
         if len(sys.argv) < 3:
             print("Usage: python -m selfai add \"title\" [description]")

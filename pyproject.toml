@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "selfai"
+version = "0.1.0"
+description = "Self-improving AI system with planning-first workflow"
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "pytest-xdist>=3.0",  # Parallel execution
+    "pytest-timeout>=2.0",
+]
+
+dev = [
+    "selfai[test]",
+]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-v --tb=short"
+testpaths = ["tests", "."]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+
+# For parallel execution: pytest -n auto
+# Each worker gets isolated environment via fixtures

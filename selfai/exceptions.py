@@ -44,3 +44,18 @@ class GitOperationError(SelfAIException):
 class ValidationError(SelfAIException):
     """Raised when input validation fails."""
     pass
+
+
+class DiscoveryError(SelfAIException):
+    """Raised when discovery fails."""
+    pass
+
+
+class DiscoveryTimeoutError(DiscoveryError):
+    """Raised when discovery scan times out."""
+    pass
+
+
+class DiscoveryParseError(DiscoveryError):
+    """Raised when discovery output cannot be parsed."""
+    pass

@@ -21,6 +21,9 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .database import Database, MAX_PARALLEL_TASKS, MAX_TEST_ATTEMPTS
+from .test_environment import TestEnvironmentManager
+from .discovery import DiscoveryEngine, DiscoveryCategory
+from .monitoring import SelfHealingMonitor
 
 logger = logging.getLogger('selfai')
 
@@ -43,8 +46,17 @@ class SelfAIRunner:
         self.lock_file = self.data_dir / 'runner.lock'
         self.lock_fd = None
 
+        # Initialize test environment manager for isolated testing
+        self.test_env_manager = TestEnvironmentManager(
+            repo_path,
+            max_environments=MAX_PARALLEL_TASKS
+        )
+
         # Setup logging
         self._setup_logging()
+
+        # Initialize self-healing monitor
+        self.monitor = SelfHealingMonitor(repo_path)
 
     def _setup_logging(self):
         """Setup file logging."""
@@ -81,13 +93,60 @@ class SelfAIRunner:
             except Exception:
                 pass
 
-    def run(self):
-        """Main run loop."""
+    def _discover_existing_features(self, categories: List[str] = None) -> int:
+        """Discover potential improvements in the codebase.
+
+        Returns the number of new improvements discovered.
+        """
+        logger.info("Starting autonomous improvement discovery...")
+
+        # Map string categories to enums
+        if categories:
+            cat_enums = [DiscoveryCategory(c) for c in categories]
+        else:
+            cat_enums = None
+
+        engine = DiscoveryEngine(self.repo_path, self.db)
+        discoveries = engine.discover_all(cat_enums)
+
+        # Filter out already existing improvements
+        new_discoveries = engine._filter_existing(discoveries)
+
+        # Add to database
+        added_count = 0
+        for d in new_discoveries:
+            try:
+                self.db.add_discovered(
+                    title=d.title,
+                    description=d.description,
+                    category=d.category.value,
+                    priority=d.priority,
+                    discovery_source=d.category.value,
+                    metadata=d.metadata,
+                    confidence=d.confidence
+                )
+                added_count += 1
+                logger.info(f"Discovered: {d.title} (priority: {d.priority})")
+            except Exception as e:
+                logger.warning(f"Failed to add discovery '{d.title}': {e}")
+
+        logger.info(f"Discovery complete: {added_count} new improvements found")
+        return added_count
+
+    def run(self, discover: bool = False):
+        """Main run loop.
+
+        Args:
+            discover: If True, run improvement discovery before other phases
+        """
         if not self.acquire_lock():
             logger.info("Another instance is running, skipping")
             return
 
         try:
+            # Start monitoring at the beginning of run
+            self.monitor.start()
+
             start_time = time.time()
             logger.info("=" * 50)
             logger.info("SelfAI Run Started")
@@ -97,6 +156,11 @@ class SelfAIRunner:
             logger.info(f"Stats: {stats}")
 
             tasks_processed = 0
+
+            # Phase 0: Discovery (if enabled)
+            if discover:
+                discovered = self._discover_existing_features()
+                logger.info(f"Phase 0: Discovered {discovered} new improvements")
 
             # Phase 1: Generate plans for pending tasks
             pending = self.db.get_pending_planning(limit=MAX_PARALLEL_TASKS)
@@ -134,17 +198,63 @@ class SelfAIRunner:
             duration = time.time() - start_time
             logger.info(f"Run completed: {tasks_processed} tasks in {duration:.1f}s")
 
+            # Log monitoring metrics
+            metrics = self.monitor.get_metrics()
+            logger.info(f"Monitoring metrics: {metrics}")
+
         except Exception as e:
             logger.error(f"Run failed: {e}")
         finally:
+            # Stop monitoring
+            self.monitor.stop()
             self.release_lock()
 
+    def _extract_key_features(self, plan_content: str) -> str:
+        """Extract key features from a plan for the optimized summary."""
+        try:
+            # Try to parse as JSON first
+            # Look for JSON block in the content
+            json_start = plan_content.find('{')
+            json_end = plan_content.rfind('}') + 1
+            if json_start >= 0 and json_end > json_start:
+                json_str = plan_content[json_start:json_end]
+                plan_data = json.loads(json_str)
+
+                # Build summary from key fields
+                parts = []
+                if plan_data.get('overview'):
+                    parts.append(plan_data['overview'][:150])
+                if plan_data.get('complexity'):
+                    parts.append(f"[{plan_data['complexity']}]")
+                if plan_data.get('implementation_steps'):
+                    steps = len(plan_data['implementation_steps'])
+                    parts.append(f"{steps} steps")
+
+                return ' | '.join(parts)
+
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+
+        # Fallback: extract first meaningful line
+        lines = [l.strip() for l in plan_content.split('\n') if l.strip() and not l.startswith('```')]
+        if lines:
+            return lines[0][:150]
+
+        return plan_content[:100]
+
     def _generate_plan(self, task: Dict):
-        """Generate a detailed plan for a task using Claude with internet research."""
+        """Generate a detailed plan for a task, reusing existing plan if available."""
         imp_id = task['id']
         title = task['title']
         description = task.get('description', '')
         user_feedback = task.get('user_feedback', '')
+
+        # Check for plan reuse (for retried tasks)
+        existing_plan = self.db.get_plan_for_reuse(imp_id)
+        if existing_plan and not user_feedback:
+            logger.info(f"Reusing existing plan for #{imp_id}: {title}")
+            self.db.save_plan(imp_id, existing_plan)
+            return
 
         logger.info(f"Generating plan for #{imp_id}: {title}")
         self.db.mark_planning(imp_id)
@@ -213,7 +323,8 @@ Be thorough and detailed. This plan will be reviewed by a human before execution
 
             if result.returncode == 0 and result.stdout.strip():
                 plan_content = result.stdout.strip()
-                self.db.save_plan(imp_id, plan_content)
+                optimized = self._extract_key_features(plan_content)
+                self.db.save_plan(imp_id, plan_content, optimized)
                 logger.info(f"Plan generated for #{imp_id}, awaiting review")
             else:
                 error = result.stderr or "No output from Claude"
@@ -293,14 +404,19 @@ IMPORTANT: Only implement what's in the plan. Do not add extra features.
             self.db.mark_failed(imp_id, str(e))
 
     def _run_test(self, task: Dict):
-        """Run tests for a task."""
+        """Run tests for a task in isolated environment."""
         imp_id = task['id']
         title = task['title']
         test_count = task.get('test_count', 0)
 
         logger.info(f"Testing #{imp_id}: {title} (attempt {test_count + 1}/{MAX_TEST_ATTEMPTS})")
 
-        prompt = f"""Test the implementation for: {title}
+        # Create isolated test environment
+        test_env = None
+        try:
+            test_env = self.test_env_manager.create_environment(imp_id)
+
+            prompt = f"""Test the implementation for: {title}
 
 Run appropriate tests to verify the feature works correctly:
 1. Check for syntax errors
@@ -312,13 +428,13 @@ If tests PASS, respond with: TEST_PASSED
 If tests FAIL, respond with: TEST_FAILED followed by the error details
 """
 
-        try:
             result = subprocess.run(
                 [CLAUDE_CMD, '-p', prompt, '--allowedTools', 'Read,Bash,Glob,Grep'],
                 capture_output=True,
                 text=True,
                 timeout=300,
-                cwd=str(self.repo_path)
+                cwd=str(test_env.worktree_path or self.repo_path),
+                env=test_env.as_subprocess_env()
             )
 
             output = result.stdout.strip()
@@ -335,7 +451,12 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
         except subprocess.TimeoutExpired:
             self.db.mark_test_failed(imp_id, "Test timed out")
         except Exception as e:
+            logger.error(f"Test execution error for #{imp_id}: {e}")
             self.db.mark_test_failed(imp_id, str(e))
+        finally:
+            # Always cleanup the test environment
+            if test_env:
+                self.test_env_manager.release_environment(imp_id)
 
     def _merge_and_push(self, imp_id: int, title: str):
         """Merge changes and push to origin."""
@@ -369,16 +490,17 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
         """Update the HTML dashboard."""
         stats = self.db.get_stats()
         tasks = self.db.get_all()
+        discovery_stats = self.db.get_discovery_stats()
 
         # Generate HTML
-        html = self._generate_dashboard_html(stats, tasks)
+        html = self._generate_dashboard_html(stats, tasks, discovery_stats)
 
         # Write dashboard
         dashboard_path = self.data_dir / 'dashboard.html'
         dashboard_path.write_text(html)
         logger.info(f"Dashboard updated: {stats}")
 
-    def _generate_dashboard_html(self, stats: Dict, tasks: List[Dict]) -> str:
+    def _generate_dashboard_html(self, stats: Dict, tasks: List[Dict], discovery_stats: Dict) -> str:
         """Generate dashboard HTML."""
         # Status colors
         status_colors = {
@@ -402,7 +524,11 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
 
             # Plan content
             plan = task.get('plan_content', '') or ''
-            plan_preview = plan[:100].replace('"', '&quot;').replace('<', '&lt;').replace('\n', ' ')
+            optimized = task.get('optimized_plan', '') or ''
+
+            # Display optimized plan if available, otherwise plan preview
+            display_text = optimized if optimized else plan[:100]
+            display_preview = display_text[:80].replace('"', '&quot;').replace('<', '&lt;').replace('\n', ' ')
 
             # Store plan data for JavaScript - escape </script> to prevent breaking HTML
             if plan:
@@ -431,7 +557,7 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
                 <td>{task['id']}</td>
                 <td>{task['title']}</td>
                 <td><span class="status-badge" style="background: {color}20; color: {color}">{status}</span></td>
-                <td class="plan-cell">{plan_preview[:50]}{'...' if len(plan_preview) > 50 else '' if plan else '<em>Pending</em>'}</td>
+                <td class="plan-cell">{display_preview}{'...' if len(display_text) > 80 else '' if display_text else '<em>Pending</em>'}</td>
                 <td>{test_info}</td>
                 <td>{actions}</td>
             </tr>
@@ -605,7 +731,7 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
                     <th>ID</th>
                     <th>Feature</th>
                     <th>Status</th>
-                    <th>Plan Preview</th>
+                    <th>Key Features</th>
                     <th>Tests</th>
                     <th>Actions</th>
                 </tr>
@@ -642,9 +768,31 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
         let currentTaskId = null;
         const plans = {json.dumps(plans_data)};
 
-        function showCommand(cmd) {{
-            // Use prompt() which works on file:// protocol
-            window.prompt('Copy this command (Ctrl+C or Cmd+C):', cmd);
+        function showToast(msg, isError) {{
+            const toast = document.createElement('div');
+            toast.style.cssText = 'position:fixed;bottom:20px;right:20px;padding:15px 25px;border-radius:8px;color:white;z-index:10000;background:' + (isError ? '#ef4444' : '#22c55e');
+            toast.textContent = msg;
+            document.body.appendChild(toast);
+            setTimeout(() => toast.remove(), 3000);
+        }}
+
+        async function apiCall(endpoint, method, body) {{
+            try {{
+                const response = await fetch(endpoint, {{
+                    method: method,
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: body ? JSON.stringify(body) : undefined
+                }});
+                const data = await response.json();
+                if (data.success) {{
+                    showToast(data.message);
+                    setTimeout(() => location.reload(), 1000);
+                }} else {{
+                    showToast(data.error || 'Request failed', true);
+                }}
+            }} catch (e) {{
+                showToast('Server not running. Start with: python -m selfai serve', true);
+            }}
         }}
 
         function showPlan(id) {{
@@ -666,7 +814,9 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
         }}
 
         function approvePlan(id) {{
-            showCommand('python -m selfai approve ' + id);
+            if (confirm('Approve plan for task #' + id + '?')) {{
+                apiCall('/api/approve/' + id, 'POST');
+            }}
         }}
 
         function showFeedback(id) {{
@@ -681,14 +831,16 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
         function submitFeedback() {{
             const feedback = document.getElementById('feedbackText').value;
             if (feedback) {{
-                const cmd = 'python -m selfai feedback ' + currentTaskId + ' "' + feedback.replace(/"/g, '\\\\"') + '"';
-                showCommand(cmd);
+                apiCall('/api/feedback/' + currentTaskId, 'POST', {{ feedback: feedback }});
             }}
             closeModal();
         }}
 
         function reEnable(id) {{
-            showCommand('python -m selfai reenable ' + id);
+            const feedback = prompt('Optional feedback for re-enabling task #' + id + ':', '');
+            if (feedback !== null) {{
+                apiCall('/api/reenable/' + id, 'POST', {{ feedback: feedback }});
+            }}
         }}
 
         // Close modals when clicking outside

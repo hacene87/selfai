@@ -1,6 +1,8 @@
 """SQLite database for tracking improvements with planning-first workflow."""
 import sqlite3
 import json
+import threading
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -37,14 +39,65 @@ VALID_STATUSES = [
 class Database:
     """SQLite database manager for improvements with planning-first workflow."""
 
+    # Class-level registry of active databases for isolated instances
+    _instances: Dict[str, 'Database'] = {}
+    _instance_lock = threading.Lock()
+
     def __init__(self, db_path: Path):
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
+    @classmethod
+    def get_isolated_instance(cls, base_path: Path, env_id: str) -> 'Database':
+        """
+        Get or create isolated database instance for test environment.
+
+        Args:
+            base_path: Base path for test data
+            env_id: Environment identifier
+
+        Returns:
+            Isolated Database instance
+        """
+        with cls._instance_lock:
+            if env_id not in cls._instances:
+                db_path = base_path / 'test_data' / env_id / 'improvements.db'
+                db_path.parent.mkdir(parents=True, exist_ok=True)
+                cls._instances[env_id] = cls(db_path)
+            return cls._instances[env_id]
+
+    @classmethod
+    def release_isolated_instance(cls, env_id: str):
+        """
+        Release and cleanup isolated database instance.
+
+        Args:
+            env_id: Environment identifier to release
+        """
+        with cls._instance_lock:
+            if env_id in cls._instances:
+                db = cls._instances[env_id]
+                # Close connections and cleanup
+                try:
+                    if db.db_path.exists():
+                        db.db_path.unlink()
+                        # Try to remove parent directory if empty
+                        try:
+                            db.db_path.parent.rmdir()
+                        except OSError:
+                            pass  # Directory not empty
+                except Exception as e:
+                    logger.warning(f"Error cleaning up database for {env_id}: {e}")
+                del cls._instances[env_id]
+
     def _init_db(self):
         """Initialize database schema for planning workflow."""
-        with sqlite3.connect(self.db_path) as conn:
+        # Use longer timeout and WAL mode for better concurrency
+        with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+            # Enable WAL mode for better concurrency
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA busy_timeout=30000')  # 30 seconds
             # Create new simplified table
             conn.execute('''
             CREATE TABLE IF NOT EXISTS improvements (
@@ -89,6 +142,12 @@ class Database:
                 'ALTER TABLE improvements ADD COLUMN test_count INTEGER DEFAULT 0',
                 'ALTER TABLE improvements ADD COLUMN completed_at TEXT',
                 'ALTER TABLE improvements ADD COLUMN last_error TEXT',
+                'ALTER TABLE improvements ADD COLUMN optimized_plan TEXT',  # Summary of key features
+                'ALTER TABLE improvements ADD COLUMN discovery_source TEXT',
+                'ALTER TABLE improvements ADD COLUMN discovery_metadata TEXT',
+                'ALTER TABLE improvements ADD COLUMN original_plan_id INTEGER',
+                'ALTER TABLE improvements ADD COLUMN discovery_timestamp TEXT',
+                'ALTER TABLE improvements ADD COLUMN confidence_score REAL DEFAULT 0.5',
             ]
 
             for migration in migrations:
@@ -100,6 +159,20 @@ class Database:
             conn.execute('CREATE INDEX IF NOT EXISTS idx_status ON improvements(status)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_priority ON improvements(priority)')
             conn.commit()
+
+    @contextmanager
+    def get_connection(self):
+        """Context manager for database connections with proper cleanup."""
+        conn = sqlite3.connect(str(self.db_path), timeout=30.0)
+        try:
+            conn.execute('PRAGMA journal_mode=WAL')
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def add(self, title: str, description: str, category: str = 'general',
             priority: int = 50, source: str = 'ai_discovered') -> int:
@@ -205,16 +278,28 @@ class Database:
         """Mark task as currently being planned."""
         return self._update_status(imp_id, 'planning')
 
-    def save_plan(self, imp_id: int, plan_content: str) -> bool:
+    def save_plan(self, imp_id: int, plan_content: str, optimized_plan: str = '') -> bool:
         """Save the generated plan and move to review status."""
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('''
                 UPDATE improvements
-                SET plan_content = ?, plan_status = 'reviewing', status = 'plan_review'
+                SET plan_content = ?, plan_status = 'reviewing', status = 'plan_review',
+                    optimized_plan = ?
                 WHERE id = ?
-            ''', (plan_content, imp_id))
+            ''', (plan_content, optimized_plan, imp_id))
             conn.commit()
             logger.info(f"Plan saved for #{imp_id}, awaiting review")
+            return True
+
+    def update_optimized_plan(self, imp_id: int, optimized_plan: str) -> bool:
+        """Update the optimized plan summary."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('''
+                UPDATE improvements
+                SET optimized_plan = ?
+                WHERE id = ?
+            ''', (optimized_plan, imp_id))
+            conn.commit()
             return True
 
     def approve_plan(self, imp_id: int) -> bool:
@@ -368,3 +453,81 @@ class Database:
     def can_start_new_task(self) -> bool:
         """Check if we can start a new task (under parallel limit)."""
         return self.get_active_count() < MAX_PARALLEL_TASKS
+
+    def add_discovered(self, title: str, description: str, category: str,
+                       priority: int, discovery_source: str, metadata: Dict,
+                       confidence: float = 0.5) -> int:
+        """Add a discovered improvement with metadata."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute('''
+                INSERT INTO improvements
+                (title, description, category, priority, source, created_at, status,
+                 discovery_source, discovery_metadata, discovery_timestamp, confidence_score)
+                VALUES (?, ?, ?, ?, 'ai_discovered', ?, 'pending', ?, ?, ?, ?)
+            ''', (title, description, category, priority, datetime.now().isoformat(),
+                  discovery_source, json.dumps(metadata), datetime.now().isoformat(),
+                  confidence))
+            conn.commit()
+            return cursor.lastrowid
+
+    def get_plan_for_reuse(self, imp_id: int) -> Optional[str]:
+        """Get original plan for a task (for retry reuse)."""
+        with sqlite3.connect(self.db_path) as conn:
+            # First check if this task has an original_plan_id
+            cursor = conn.execute(
+                'SELECT original_plan_id, plan_content FROM improvements WHERE id = ?',
+                (imp_id,)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+
+            original_id, plan_content = row
+
+            # If there's an original plan reference, fetch that
+            if original_id:
+                cursor = conn.execute(
+                    'SELECT plan_content FROM improvements WHERE id = ?',
+                    (original_id,)
+                )
+                original_row = cursor.fetchone()
+                if original_row and original_row[0]:
+                    return original_row[0]
+
+            # Otherwise return this task's own plan
+            return plan_content
+
+    def link_to_original_plan(self, new_id: int, original_id: int) -> bool:
+        """Link a retried task to its original plan."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                'UPDATE improvements SET original_plan_id = ? WHERE id = ?',
+                (original_id, new_id)
+            )
+            conn.commit()
+            return True
+
+    def get_discoveries_by_category(self, category: str) -> List[Dict]:
+        """Get all discovered improvements by category."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute('''
+                SELECT * FROM improvements
+                WHERE discovery_source IS NOT NULL AND category = ?
+                ORDER BY priority DESC
+            ''', (category,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_discovery_stats(self) -> Dict:
+        """Get statistics about discovered improvements."""
+        with sqlite3.connect(self.db_path) as conn:
+            stats = {}
+            cursor = conn.execute('''
+                SELECT discovery_source, COUNT(*) as count
+                FROM improvements
+                WHERE discovery_source IS NOT NULL
+                GROUP BY discovery_source
+            ''')
+            for row in cursor.fetchall():
+                stats[row[0]] = row[1]
+            return stats
