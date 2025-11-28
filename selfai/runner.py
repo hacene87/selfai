@@ -31,7 +31,8 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, List, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from .database import Database, LEVEL_NAMES
+from .database import Database, LEVEL_NAMES, MAX_TEST_RETRIES
+from .exceptions import ValidationError
 
 logger = logging.getLogger('selfai')
 
@@ -49,11 +50,6 @@ class MergeConflictError(WorktreeError):
 
 class DiskSpaceError(WorktreeError):
     """Raised when insufficient disk space is available."""
-    pass
-
-
-class ValidationError(WorktreeError):
-    """Raised when input validation fails."""
     pass
 
 
@@ -358,21 +354,40 @@ class WorktreeManager:
             if not worktree_path:
                 raise WorktreeError(f"Cannot resolve worktree path collision for feature #{feature_id}")
 
-            # Clean up existing worktree if any
-            if base_worktree_path.exists():
-                self.cleanup_worktree(feature_id)
+            # Force-create branch to handle race conditions atomically
+            # First, try to create normally
+            success, output = self._run_git('branch', branch_name, 'main', retry=False)
 
-            # Create branch from main (with retry)
-            success, output = self._run_git('branch', branch_name, 'main')
-            if not success:
-                # Branch might already exist, try to reset it
-                logger.info(f"Branch {branch_name} exists, recreating...")
-                self._run_git('branch', '-D', branch_name, retry=False)
-                success, output = self._run_git('branch', branch_name, 'main')
+            if not success and 'already exists' in output:
+                # Branch exists due to race condition - must cleanup worktree FIRST before deleting branch
+                logger.info(f"Branch {branch_name} exists (race condition), force recreating...")
+
+                # CRITICAL: Remove worktree BEFORE attempting to delete branch
+                # Git refuses to delete branches that are checked out in worktrees
+                # ALWAYS cleanup worktree - don't check if directory exists, as worktree
+                # might be registered in Git even if directory is missing
+                logger.debug(f"Cleaning up existing worktree before branch deletion (feature #{feature_id})")
+                self.cleanup_worktree(feature_id, force=True)
+
+                # Now delete branch with retry (ignore if already deleted)
+                delete_success, delete_output = self._run_git('branch', '-D', branch_name)
+                if not delete_success and 'not found' not in delete_output:
+                    # Only fail if it's not a "branch not found" error
+                    raise WorktreeError(
+                        f"Failed to delete existing branch {branch_name}: {delete_output}"
+                    )
+
+                # Recreate immediately without retry to minimize race window
+                success, output = self._run_git('branch', branch_name, 'main', retry=False)
                 if not success:
                     raise WorktreeError(
-                        f"Failed to create branch {branch_name} for feature #{feature_id}: {output}"
+                        f"Failed to recreate branch {branch_name} for feature #{feature_id}: {output}"
                     )
+            elif not success:
+                # Different error - fail
+                raise WorktreeError(
+                    f"Failed to create branch {branch_name} for feature #{feature_id}: {output}"
+                )
 
             # Create worktree (with retry)
             success, output = self._run_git('worktree', 'add', str(worktree_path), branch_name)
@@ -393,65 +408,85 @@ class WorktreeManager:
             logger.error(f"Unexpected error creating worktree for feature #{feature_id}: {e}")
             raise WorktreeError(f"Unexpected worktree creation error: {e}")
 
-    def cleanup_worktree(self, feature_id: int) -> None:
+    def cleanup_worktree(self, feature_id: int, force: bool = False) -> None:
         """Remove a worktree and its branch with enhanced error handling.
 
         Args:
             feature_id: Feature ID to cleanup
+            force: If True, force cleanup even if disabled by default
 
         Note:
-            DISABLED: Worktrees are now kept for debugging and to prevent race conditions.
-            Manual cleanup can be done via: git worktree prune && rm -rf .selfai_data/worktrees/*
+            By default disabled to prevent race conditions, but can be forced
+            when recreating worktrees to avoid branch deletion errors.
         """
-        # DISABLED - Don't delete worktrees to prevent race conditions
-        logger.debug(f"Worktree cleanup skipped for feature #{feature_id} (cleanup disabled)")
-        return
+        if not force:
+            # DISABLED by default - Don't delete worktrees to prevent race conditions
+            logger.debug(f"Worktree cleanup skipped for feature #{feature_id} (cleanup disabled)")
+            return
 
-        worktree_path = self.worktrees_path / f"wt-{feature_id}"
+        # Find ALL worktree paths for this feature (including collision-resolved ones)
+        # by checking both Git's worktree list AND the filesystem
+        worktree_paths_to_cleanup = []
+        branch_name = None
 
-        if not worktree_path.exists():
-            # Also check for collision-resolved paths (wt-{id}-timestamp or wt-{id}-N)
-            pattern = f"wt-{feature_id}-*"
-            matches = list(self.worktrees_path.glob(pattern))
-            if matches:
-                worktree_path = matches[0]  # Use first match
-            else:
-                logger.debug(f"Worktree path does not exist, skipping cleanup: {worktree_path}")
-                return
-
-        try:
-            # Get branch name before removing
-            branch_name = None
-            success, output = self._run_git('worktree', 'list', '--porcelain', retry=False)
-            if success:
-                lines = output.split('\n')
-                for i, line in enumerate(lines):
-                    if str(worktree_path) in line:
-                        # Branch name is in the "branch" line after worktree line
+        # 1. Check Git's worktree list for any wt-{feature_id} paths
+        success, output = self._run_git('worktree', 'list', '--porcelain', retry=False)
+        if success:
+            lines = output.split('\n')
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+                if line.startswith('worktree '):
+                    wt_path_str = line.replace('worktree ', '').strip()
+                    wt_path = Path(wt_path_str)
+                    # Match wt-{feature_id} or wt-{feature_id}-*
+                    if wt_path.name == f"wt-{feature_id}" or wt_path.name.startswith(f"wt-{feature_id}-"):
+                        worktree_paths_to_cleanup.append(wt_path)
+                        # Extract branch name from following lines
                         for j in range(i + 1, min(i + 5, len(lines))):
                             if lines[j].startswith('branch '):
                                 branch_name = lines[j].replace('branch refs/heads/', '').strip()
                                 break
-                        break
+                i += 1
 
-            # Remove worktree from git
-            success, output = self._run_git('worktree', 'remove', str(worktree_path), '--force', retry=False)
-            if not success:
-                logger.warning(f"Git worktree remove failed for {worktree_path.name}: {output}")
+        # 2. Also check filesystem for any wt-{feature_id}* directories
+        if self.worktrees_path.exists():
+            pattern = f"wt-{feature_id}*"
+            for path in self.worktrees_path.glob(pattern):
+                if path.is_dir() and path not in worktree_paths_to_cleanup:
+                    worktree_paths_to_cleanup.append(path)
 
-            # Force remove directory if still exists (locked worktree, etc.)
-            if worktree_path.exists():
-                try:
-                    shutil.rmtree(worktree_path, ignore_errors=False)
-                    logger.info(f"Force removed worktree directory: {worktree_path.name}")
-                except PermissionError:
-                    logger.error(f"Permission denied removing locked worktree: {worktree_path.name}")
-                except Exception as e:
-                    logger.warning(f"Failed to remove worktree directory: {e}")
-                    # Last resort: ignore_errors=True
-                    shutil.rmtree(worktree_path, ignore_errors=True)
+        if not worktree_paths_to_cleanup:
+            logger.debug(f"No worktrees found for feature #{feature_id}, skipping cleanup")
+            return
 
-            # Cleanup branch if found
+        try:
+            # Remove all found worktrees
+            for worktree_path in worktree_paths_to_cleanup:
+                # Force remove directory FIRST (this is safer)
+                if worktree_path.exists():
+                    try:
+                        shutil.rmtree(worktree_path, ignore_errors=False)
+                        logger.info(f"Force removed worktree directory: {worktree_path.name}")
+                    except PermissionError:
+                        logger.error(f"Permission denied removing locked worktree: {worktree_path.name}")
+                    except Exception as e:
+                        logger.warning(f"Failed to remove worktree directory: {e}")
+                        # Last resort: ignore_errors=True
+                        shutil.rmtree(worktree_path, ignore_errors=True)
+
+                # Remove worktree from git registry
+                success, output = self._run_git('worktree', 'remove', str(worktree_path), '--force', retry=False)
+                if not success:
+                    logger.debug(f"Git worktree remove failed for {worktree_path.name}: {output}")
+
+            # CRITICAL: Prune stale worktree entries from Git's registry
+            # This removes worktree references even if 'git worktree remove' failed
+            prune_success, prune_output = self._run_git('worktree', 'prune', retry=False)
+            if not prune_success:
+                logger.warning(f"Git worktree prune failed: {prune_output}")
+
+            # Cleanup branch if found (now safe because worktree is pruned)
             if branch_name:
                 success, output = self._run_git('branch', '-D', branch_name, retry=False)
                 if success:
@@ -768,10 +803,10 @@ Be concise and actionable.'''
         Raises:
             ValidationError: If stats or repo_path is invalid
         """
-        if not isinstance(stats, dict):
-            raise ValidationError(f"stats must be a dict, got {type(stats).__name__}")
         if stats is None:
             raise ValidationError("stats cannot be None")
+        if not isinstance(stats, dict):
+            raise ValidationError(f"stats must be a dict, got {type(stats).__name__}")
 
         if not isinstance(repo_path, Path):
             raise ValidationError(f"repo_path must be a Path object, got {type(repo_path).__name__}")
@@ -837,10 +872,10 @@ OUTPUT FORMAT (JSON):
         Raises:
             ValidationError: If issues is invalid
         """
-        if not isinstance(issues, list):
-            raise ValidationError(f"issues must be a list, got {type(issues).__name__}")
         if issues is None:
             raise ValidationError("issues cannot be None")
+        if not isinstance(issues, list):
+            raise ValidationError(f"issues must be a list, got {type(issues).__name__}")
 
         try:
             existing = []
@@ -874,10 +909,10 @@ OUTPUT FORMAT (JSON):
         Raises:
             ValidationError: If improvements is invalid
         """
-        if not isinstance(improvements, list):
-            raise ValidationError(f"improvements must be a list, got {type(improvements).__name__}")
         if improvements is None:
             raise ValidationError("improvements cannot be None")
+        if not isinstance(improvements, list):
+            raise ValidationError(f"improvements must be a list, got {type(improvements).__name__}")
 
         try:
             existing = []
@@ -989,17 +1024,19 @@ SUCCESS = Feature is production-ready with full coverage"""
     }
 
     def __init__(self, repo_path: Path):
-        self.repo_path = repo_path
-        self.workspace_path = repo_path / '.selfai_data'
+        # Always use absolute paths to avoid issues with working directory changes
+        self.repo_path = repo_path.resolve()
+        self.workspace_path = self.repo_path / '.selfai_data'
         self.data_path = self.workspace_path / 'data'
         self.logs_path = self.workspace_path / 'logs'
         self.lock_path = self.data_path / self.LOCK_FILE
+        self.worktrees_path = self.workspace_path / 'worktrees'
 
         self.data_path.mkdir(parents=True, exist_ok=True)
         self.logs_path.mkdir(parents=True, exist_ok=True)
 
         self.db = Database(self.data_path / 'improvements.db')
-        self.worktree_mgr = WorktreeManager(repo_path, self.workspace_path)
+        self.worktree_mgr = WorktreeManager(self.repo_path, self.workspace_path)
         self.log_analyzer = LogAnalyzer(self.logs_path, self.CLAUDE_CMD)
         self._setup_logging()
         self._ensure_git_repo()
@@ -1031,6 +1068,111 @@ SUCCESS = Feature is production-ready with full coverage"""
                 ['git', 'checkout', '-B', 'main'],
                 capture_output=True, cwd=str(self.repo_path)
             )
+
+    def _validate_plan(self, plan: str, improvement: Dict) -> bool:
+        """Validate plan structure and content.
+
+        Args:
+            plan: Plan content as string
+            improvement: Improvement dict
+
+        Returns:
+            True if valid, False otherwise
+        """
+        from .validators import PlanValidator
+        from .exceptions import PlanValidationError
+
+        try:
+            plan_dict = PlanValidator.validate_plan_structure(plan)
+            PlanValidator.validate_file_paths(plan_dict, self.repo_path)
+            PlanValidator.validate_dependencies(plan_dict)
+
+            imp_id = improvement.get('id')
+            level = improvement.get('current_level', 1)
+            logger.info(f"Plan validation passed for improvement #{imp_id} at level {level}")
+            return True
+
+        except PlanValidationError as e:
+            imp_id = improvement.get('id')
+            logger.error(f"Plan validation failed for improvement #{imp_id}: {e}")
+            self.db.mark_failed(imp_id, f"Invalid plan: {e}")
+            return False
+
+    def _check_file_conflicts(self, improvement: Dict, plan: str) -> bool:
+        """Check for file conflicts with other in-progress improvements.
+
+        Args:
+            improvement: Current improvement
+            plan: Plan containing files to modify
+
+        Returns:
+            True if no conflicts, False if conflicts detected
+        """
+        from .exceptions import WorktreeConflictError
+
+        try:
+            plan_dict = json.loads(plan)
+            files_to_modify = plan_dict.get('files_to_modify', [])
+
+            if not files_to_modify:
+                return True
+
+            conflicting = self.db.get_improvements_by_files(files_to_modify)
+
+            if conflicting:
+                imp_id = improvement.get('id')
+                conflict_ids = [c['id'] for c in conflicting if c['id'] != imp_id]
+
+                if conflict_ids:
+                    logger.warning(
+                        f"File conflict detected for improvement #{imp_id}. "
+                        f"Conflicting improvements: {conflict_ids}. "
+                        f"Files: {', '.join(files_to_modify[:3])}"
+                    )
+                    error_msg = (
+                        f"File conflict with improvements {conflict_ids}. "
+                        f"Waiting for them to complete."
+                    )
+                    self.db.update_status(imp_id, 'pending', error=error_msg)
+                    return False
+
+            return True
+
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning(f"Cannot parse plan for conflict detection: {e}")
+            return True
+
+    def _get_execution_checkpoint(self, improvement: Dict) -> Optional[Dict]:
+        """Get execution checkpoint for recovery.
+
+        Args:
+            improvement: Improvement dict
+
+        Returns:
+            Checkpoint data as dict or None
+        """
+        imp_id = improvement.get('id')
+        checkpoint_str = self.db.get_execution_checkpoint(imp_id)
+
+        if not checkpoint_str:
+            return None
+
+        try:
+            return json.loads(checkpoint_str)
+        except json.JSONDecodeError as e:
+            logger.warning(f"Invalid checkpoint data for improvement #{imp_id}: {e}")
+            return None
+
+    def _save_execution_checkpoint(self, improvement: Dict, checkpoint_data: Dict) -> None:
+        """Save execution checkpoint for recovery.
+
+        Args:
+            improvement: Improvement dict
+            checkpoint_data: Checkpoint data to save
+        """
+        imp_id = improvement.get('id')
+        checkpoint_str = json.dumps(checkpoint_data)
+        self.db.save_execution_checkpoint(imp_id, checkpoint_str)
 
     def acquire_lock(self) -> bool:
         """Acquire process lock."""
@@ -1263,16 +1405,9 @@ SUCCESS = Feature is production-ready with full coverage"""
         Returns all tasks currently marked as in_progress, which need to be
         completed before starting new pending tasks.
         """
-        results = []
-        seen_ids = set()
-        while True:
-            imp = self.db.get_next_in_progress()
-            if not imp:
-                break
-            if imp['id'] not in seen_ids:
-                seen_ids.add(imp['id'])
-                results.append(imp)
-        return results
+        # Use direct database query to get ALL in_progress tasks at once
+        # This avoids the infinite loop bug from repeatedly calling get_next_in_progress()
+        return self.db.get_all_in_progress()
 
     def _get_batch_pending(self, max_count: int) -> List[Dict]:
         """Get batch of pending improvements."""
@@ -1419,25 +1554,65 @@ SUCCESS = Feature is production-ready with full coverage"""
         except Exception:
             return False
 
+    def _validate_test_environment(self, improvement: Dict) -> tuple[bool, str]:
+        """Validate that environment is ready for testing with comprehensive checks.
+
+        Returns:
+            (success, error_message) tuple
+        """
+        imp_id = improvement['id']
+        title = improvement.get('title', f'#{imp_id}')
+
+        retry_count = improvement.get('retry_count', 0)
+        if retry_count >= MAX_TEST_RETRIES:
+            return False, f"Feature has exceeded maximum test retries ({MAX_TEST_RETRIES})"
+
+        worktree_path = self.worktrees_path / f"wt-{imp_id}"
+
+        if not worktree_path.exists():
+            pattern = f"wt-{imp_id}-*"
+            matches = list(self.worktrees_path.glob(pattern))
+            if matches:
+                worktree_path = matches[0]
+            else:
+                return False, f"Worktree not found for feature #{imp_id}. Implementation may not have started."
+
+        if not (worktree_path / 'selfai').exists():
+            return False, f"Worktree missing selfai module: {worktree_path}. Worktree may be corrupted."
+
+        required_files = ['selfai/__init__.py', 'selfai/runner.py', 'selfai/database.py']
+        for req_file in required_files:
+            file_path = worktree_path / req_file
+            if not file_path.exists():
+                return False, f"Required file missing in worktree: {req_file}"
+
+        if not self.worktrees_path.exists():
+            return False, f"Worktrees directory not found: {self.worktrees_path}"
+
+        return True, ""
+
     def _run_tests(self, improvement: Dict):
-        """Run tests for current level of improvement with optimizations."""
+        """Run tests for current level of improvement with comprehensive error handling."""
         imp_id = improvement['id']
         title = improvement['title']
         level = improvement['current_level']
         level_name = LEVEL_NAMES[level]
 
-        # OPTIMIZATION 1: Skip if already passed this level
         level_col = LEVEL_NAMES[level].lower()
         current_status = improvement.get(f'{level_col}_test_status')
         if current_status == 'passed':
             logger.info(f"Skipping {level_name} tests for {title} - already passed")
             return
 
-        # OPTIMIZATION 2: Quick syntax check first (10s vs 300s timeout)
+        valid, error_msg = self._validate_test_environment(improvement)
+        if not valid:
+            logger.error(f"Test environment validation failed: {error_msg}")
+            self.db.mark_test_failed(imp_id, level, f"Environment validation failed: {error_msg}")
+            return
+
         if not self._quick_syntax_check():
             logger.warning(f"Quick syntax check failed for {title} - fixing before full test")
 
-        # OPTIMIZATION 3: Level-based timeout (MVP=180s, Enhanced=240s, Advanced=300s)
         test_timeout = {1: 180, 2: 240, 3: 300}[level]
 
         logger.info(f"Running {level_name} tests for: {title} (timeout: {test_timeout}s)")
@@ -1491,25 +1666,53 @@ After completing all steps, output ONLY this JSON:
 }}
 ```'''
 
-        result = self._execute_claude(test_prompt, timeout=test_timeout)
+        try:
+            result = self._execute_claude(test_prompt, timeout=test_timeout)
 
-        if result['success']:
-            output = result.get('output', '')
-            passed = self._parse_test_result(output)
+            if result['success']:
+                output = result.get('output', '')
+                if not output:
+                    logger.warning(f"Empty output from test execution for {title}")
+                    self.db.mark_test_failed(imp_id, level, "Empty test output - Claude returned no response")
+                    return
 
-            if passed:
-                self.db.mark_test_passed(imp_id, level, output)
-                logger.info(f"✓ {level_name} PASSED - Feature completed: {title}")
+                if len(output) < 50:
+                    logger.warning(f"Suspiciously short test output ({len(output)} chars) for {title}")
+
+                passed = self._parse_test_result(output)
+
+                if passed:
+                    self.db.mark_test_passed(imp_id, level, output[:5000])
+                    logger.info(f"✓ {level_name} PASSED - Feature completed: {title}")
+                else:
+                    retry_count = improvement.get('retry_count', 0)
+                    if retry_count == 0:
+                        logger.info(f"First failure for {title} - will retry with fixes")
+                    elif retry_count == MAX_TEST_RETRIES - 1:
+                        logger.warning(f"Final retry attempt for {title} - will be marked permanently failed if this fails")
+                    self.db.mark_test_failed(imp_id, level, output[:5000])
+                    logger.warning(f"✗ {level_name} FAILED for {title} - Will retry (attempt {retry_count + 1}/{MAX_TEST_RETRIES})")
             else:
-                # OPTIMIZATION 4: On first failure, try quick fix before full retry
-                retry_count = improvement.get('retry_count', 0)
-                if retry_count == 0:
-                    logger.info(f"First failure for {title} - attempting quick fix")
-                self.db.mark_test_failed(imp_id, level, output)
-                logger.warning(f"✗ {level_name} FAILED for {title} - Will retry (attempt {retry_count + 1})")
-        else:
-            self.db.mark_test_failed(imp_id, level, result.get('error', 'Test failed'))
-            logger.error(f"Test execution failed for: {title}")
+                error_msg = result.get('error', 'Test execution failed')
+                if 'api' in error_msg.lower() or 'anthropic' in error_msg.lower():
+                    logger.error(f"Claude API error for: {title} - {error_msg}")
+                    self.db.mark_test_failed(imp_id, level, f"Claude API error: {error_msg}"[:5000])
+                else:
+                    logger.error(f"Test execution error for: {title} - {error_msg}")
+                    self.db.mark_test_failed(imp_id, level, f"Execution error: {error_msg}"[:5000])
+
+        except subprocess.TimeoutExpired:
+            logger.error(f"Test execution timed out after {test_timeout}s for: {title}")
+            timeout_msg = f"Test timed out after {test_timeout}s. Consider breaking feature into smaller pieces or increasing timeout for {level_name} level."
+            self.db.mark_test_failed(imp_id, level, timeout_msg)
+        except KeyboardInterrupt:
+            logger.warning(f"Test interrupted by user for: {title}")
+            self.db.mark_test_failed(imp_id, level, "Test interrupted by user")
+            raise
+        except Exception as e:
+            error_type = type(e).__name__
+            logger.error(f"Unexpected {error_type} during test execution for {title}: {e}")
+            self.db.mark_test_failed(imp_id, level, f"Unexpected {error_type}: {str(e)}"[:5000])
 
     def _get_test_criteria(self, level: int) -> str:
         """Get test criteria for each level."""
@@ -1540,7 +1743,11 @@ After completing all steps, output ONLY this JSON:
             logger.warning("Empty test output - marking as failed")
             return False
 
-        output_lower = output.lower()
+        try:
+            output_lower = output.lower()
+        except (AttributeError, UnicodeDecodeError) as e:
+            logger.error(f"Failed to process test output (encoding issue): {e}")
+            return False
 
         try:
             start = output.find('```json')
@@ -1548,17 +1755,35 @@ After completing all steps, output ONLY this JSON:
 
             if start != -1 and end != -1:
                 json_str = output[start + 7:end].strip()
-                try:
-                    data = json.loads(json_str)
-                    if isinstance(data, dict) and 'test_passed' in data:
-                        result = data['test_passed']
-                        if isinstance(result, bool):
-                            logger.info(f"Parsed test result from JSON: {result}")
-                            return result
+                if not json_str:
+                    logger.warning("Empty JSON block found in test output")
+                elif len(json_str) > 50000:
+                    logger.warning(f"JSON block too large ({len(json_str)} chars), likely invalid")
+                else:
+                    try:
+                        data = json.loads(json_str)
+                        if not isinstance(data, dict):
+                            logger.warning(f"JSON is not a dict: {type(data)}")
+                        elif 'test_passed' not in data:
+                            logger.warning("JSON missing required 'test_passed' field")
                         else:
-                            logger.warning(f"test_passed is not boolean: {type(result)}")
-                except json.JSONDecodeError as e:
-                    logger.warning(f"Failed to parse JSON in test output: {e}")
+                            result = data['test_passed']
+                            if isinstance(result, bool):
+                                logger.info(f"Parsed test result from JSON: {result}")
+                                return result
+                            elif isinstance(result, str):
+                                if result.lower() in ('true', 'yes', '1'):
+                                    logger.info("Converted string 'true' to boolean True")
+                                    return True
+                                elif result.lower() in ('false', 'no', '0'):
+                                    logger.info("Converted string 'false' to boolean False")
+                                    return False
+                                else:
+                                    logger.warning(f"test_passed string value unrecognized: {result}")
+                            else:
+                                logger.warning(f"test_passed is not boolean: {type(result)}")
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"Failed to parse JSON in test output: {e}")
         except Exception as e:
             logger.warning(f"Error extracting JSON from test output: {e}")
 
@@ -1839,7 +2064,16 @@ Remember: Quality over quantity. Only suggest features that truly matter.'''
             if not plan:
                 self.db.mark_failed(imp_id, "Planning failed")
                 return
+
+            if not self._validate_plan(plan, improvement):
+                logger.error(f"Plan validation failed for improvement #{imp_id}")
+                return
+
             self.db.save_plan(imp_id, level, plan)
+
+        if not self._check_file_conflicts(improvement, plan):
+            logger.warning(f"File conflicts detected for improvement #{imp_id}, deferring")
+            return
 
         # Execute the plan in the specified directory
         output = self._execute_plan(improvement, level, plan, exec_path)
@@ -2005,30 +2239,35 @@ STEP 2: Create detailed plan
 - Estimate lines of code to add/modify
 
 === OUTPUT FORMAT ===
-## Analysis
-- Current state: [what exists]
-- Gap: [what's missing]
-- Approach: [how to implement]
-
-## Implementation Plan
-1. [File: exact change description]
-2. [File: exact change description]
-...
-
-## Code Snippets (key additions)
-```python
-# Key code you'll add
+Output your plan as a JSON object with the following structure:
+```json
+{{
+  "description": "Brief summary of what will be implemented",
+  "files_to_modify": ["path/to/file1.py", "path/to/file2.py"],
+  "analysis": {{
+    "current_state": "what exists",
+    "gap": "what's missing",
+    "approach": "how to implement"
+  }},
+  "implementation_steps": [
+    "Step 1: specific action",
+    "Step 2: specific action"
+  ],
+  "verification": "How to test this works"
+}}
 ```
 
-## Verification Steps
-- How to test this works'''
+IMPORTANT: Output ONLY the JSON object, nothing else.'''
 
         # OPTIMIZATION: Level-based planning timeout (MVP=120s, Enhanced=150s, Advanced=180s)
         plan_timeout = {1: 120, 2: 150, 3: 180}[level]
         result = self._execute_claude(prompt, timeout=plan_timeout)
         if result['success']:
             logger.info(f"Plan created for {level_name}: {title}")
-            return result.get('output', '')
+            output = result.get('output', '')
+            # Extract JSON from markdown code fence if present
+            output = self._extract_json_from_output(output)
+            return output
         logger.error(f"Planning failed for: {title}")
         return None
 
@@ -2077,6 +2316,37 @@ Execute the plan now.'''
             return result.get('output', '')
         return None
 
+    def _extract_json_from_output(self, output: str) -> str:
+        """Extract JSON from Claude CLI output.
+
+        Claude CLI may wrap JSON in markdown code fences or include extra text.
+        This method extracts just the JSON content.
+
+        Args:
+            output: Raw output from Claude CLI
+
+        Returns:
+            Cleaned JSON string
+        """
+        if not output:
+            return output
+
+        # Try to find JSON in markdown code fence
+        json_pattern = r'```(?:json)?\s*\n(.*?)\n```'
+        match = re.search(json_pattern, output, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+
+        # If no code fence, try to find JSON object directly
+        # Look for content between first { and last }
+        first_brace = output.find('{')
+        last_brace = output.rfind('}')
+        if first_brace != -1 and last_brace != -1 and first_brace < last_brace:
+            return output[first_brace:last_brace + 1].strip()
+
+        # Return as-is if no JSON structure found
+        return output.strip()
+
     def _execute_claude(self, prompt: str, timeout: int = 300, work_dir: Path = None) -> Dict:
         """Execute Claude CLI command in specified directory."""
         exec_path = work_dir or self.repo_path
@@ -2106,7 +2376,7 @@ Execute the plan now.'''
             seconds: Duration in seconds (int or float), can be None
 
         Returns:
-            Formatted string like "5m 30s" or "–" if invalid
+            Formatted string like "1h 5m 30s" or "5m 30s" or "30s" or "–" if invalid
         """
         if seconds is None:
             return "–"
@@ -2117,9 +2387,15 @@ Execute the plan now.'''
                 return "–"
             if seconds < 60:
                 return f"{int(seconds)}s"
-            minutes = int(seconds // 60)
+
+            hours = int(seconds // 3600)
+            minutes = int((seconds % 3600) // 60)
             secs = int(seconds % 60)
-            return f"{minutes}m {secs}s"
+
+            if hours > 0:
+                return f"{hours}h {minutes}m {secs}s"
+            else:
+                return f"{minutes}m {secs}s"
         except (TypeError, ValueError) as e:
             logger.warning(f"Invalid duration value: {seconds}, error: {e}")
             return "–"
@@ -2140,6 +2416,11 @@ Execute the plan now.'''
                 logger.warning("Failed to get level stats, using empty dict")
                 level_stats = {}
 
+            success_fail_stats = self.db.get_success_fail_stats()
+            if success_fail_stats is None:
+                logger.warning("Failed to get success/fail stats, using empty dict")
+                success_fail_stats = {}
+
             improvements = self.db.get_tasks_with_time_estimates()
             if improvements is None:
                 logger.warning("Failed to get improvements, using empty list")
@@ -2149,7 +2430,7 @@ Execute the plan now.'''
             if active_worktrees is None:
                 active_worktrees = []
 
-            html_content = self._generate_dashboard_html(improvements, stats, level_stats, active_worktrees)
+            html_content = self._generate_dashboard_html(improvements, stats, level_stats, active_worktrees, success_fail_stats)
 
             if not html_content or not html_content.strip():
                 logger.error("Generated HTML content is empty, dashboard not updated")
@@ -2203,7 +2484,8 @@ Execute the plan now.'''
         return f'<span class="level-progress">{plan_icon} → {exec_icon} → {test_icon}</span>'
 
     def _generate_dashboard_html(self, improvements: Optional[List[Dict]], stats: Optional[Dict],
-                                   level_stats: Optional[Dict], active_worktrees: Optional[List[Path]] = None) -> str:
+                                   level_stats: Optional[Dict], active_worktrees: Optional[List[Path]] = None,
+                                   success_fail_stats: Optional[Dict] = None) -> str:
         """Generate dashboard HTML with parallel task tracking.
 
         Args:
@@ -2211,6 +2493,7 @@ Execute the plan now.'''
             stats: Overall statistics dict
             level_stats: Statistics by level dict
             active_worktrees: List of active worktree paths
+            success_fail_stats: Success/fail test statistics
 
         Returns:
             Complete HTML string for dashboard
@@ -2226,6 +2509,15 @@ Execute the plan now.'''
         if level_stats is None:
             level_stats = {}
 
+        if success_fail_stats is None or not isinstance(success_fail_stats, dict):
+            success_fail_stats = {
+                'total_passed': 0,
+                'total_failed': 0,
+                'success_rate': 0.0,
+                'total_retries': 0,
+                'avg_retries': 0.0
+            }
+
         if active_worktrees is None or not isinstance(active_worktrees, list):
             active_worktrees = []
 
@@ -2240,8 +2532,15 @@ Execute the plan now.'''
                 logger.debug(f"Could not extract ID from worktree {wt}: {e}")
                 continue
 
+        # Sort: testing first, then in_progress, then pending, then completed
+        status_order = {'testing': 0, 'in_progress': 1, 'pending': 2, 'completed': 3}
+        sorted_improvements = sorted(
+            improvements,
+            key=lambda x: (status_order.get(x.get('status', 'pending'), 2), -x.get('priority', 50))
+        )
+
         rows = []
-        for imp in improvements:
+        for imp in sorted_improvements:
             try:
                 if imp is None or not isinstance(imp, dict):
                     logger.warning(f"Skipping invalid improvement entry: {imp}")
@@ -2286,6 +2585,11 @@ Execute the plan now.'''
                     time_estimate = self._format_duration(imp['estimated_remaining'])
 
                 status_class = status.replace('_', '-')
+
+                # Use spinning indicator for parallel tasks
+                if is_parallel:
+                    parallel_indicator = '<span class="spinning-indicator">⚡</span>'
+
                 rows.append(f'''
             <tr class="{status_class}{' parallel' if is_parallel else ''}">
                 <td>{imp_id}</td>
@@ -2347,6 +2651,8 @@ Execute the plan now.'''
         .stat-card.testing .value {{ color: #3b82f6; }}
         .stat-card.completed .value {{ color: #22c55e; }}
         .stat-card.parallel .value {{ color: #a855f7; }}
+        .stat-card.success .value {{ color: #22c55e; }}
+        .stat-card.failure .value {{ color: #ef4444; }}
         table {{
             width: 100%;
             border-collapse: collapse;
@@ -2389,8 +2695,55 @@ Execute the plan now.'''
         }}
         .progress-cell {{ font-family: monospace; letter-spacing: 2px; }}
         tr.completed {{ opacity: 0.7; }}
-        tr.parallel {{ background: rgba(168,85,247,0.1); animation: pulse 2s infinite; }}
-        @keyframes pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.7; }} }}
+        tr.parallel {{ background: rgba(168,85,247,0.1); }}
+
+        /* Animated sliding bar at bottom of active rows */
+        tr.in-progress, tr.testing {{
+            position: relative;
+            overflow: visible;
+        }}
+        tr.in-progress::after, tr.testing::after {{
+            content: '';
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            height: 2px;
+            width: 30%;
+            border-radius: 2px;
+            animation: slideBar 2s ease-in-out infinite;
+        }}
+        tr.in-progress::after {{
+            background: linear-gradient(90deg, transparent, #f97316, #fb923c, transparent);
+        }}
+        tr.testing::after {{
+            background: linear-gradient(90deg, transparent, #3b82f6, #60a5fa, transparent);
+        }}
+        @keyframes slideBar {{
+            0% {{ left: 0%; }}
+            50% {{ left: 70%; }}
+            100% {{ left: 0%; }}
+        }}
+
+        /* Pulsing left border for active rows */
+        tr.in-progress td:first-child {{
+            border-left: 3px solid #f97316;
+            animation: borderPulse 1.5s ease-in-out infinite;
+        }}
+        tr.testing td:first-child {{
+            border-left: 3px solid #3b82f6;
+            animation: borderPulse 1.2s ease-in-out infinite;
+        }}
+        @keyframes borderPulse {{
+            0%, 100% {{ border-left-color: inherit; }}
+            50% {{ border-left-color: rgba(255,255,255,0.3); }}
+        }}
+
+        /* Spinning indicator for parallel tasks */
+        .spinning-indicator {{
+            display: inline-block;
+            animation: spin 1s linear infinite;
+        }}
+        @keyframes spin {{ 100% {{ transform: rotate(360deg); }} }}
     </style>
 </head>
 <body>
@@ -2414,6 +2767,26 @@ Execute the plan now.'''
             <div class="stat-card parallel">
                 <div class="value">{len(active_worktrees)}</div>
                 <div class="label">Parallel Workers</div>
+            </div>
+            <div class="stat-card success">
+                <div class="value">{success_fail_stats.get('total_passed', 0)}</div>
+                <div class="label">Tests Passed</div>
+            </div>
+            <div class="stat-card failure">
+                <div class="value">{success_fail_stats.get('total_failed', 0)}</div>
+                <div class="label">Tests Failed</div>
+            </div>
+            <div class="stat-card success">
+                <div class="value">{success_fail_stats.get('success_rate', 0.0)}%</div>
+                <div class="label">Success Rate</div>
+            </div>
+            <div class="stat-card testing">
+                <div class="value">{success_fail_stats.get('total_retries', 0)}</div>
+                <div class="label">Total Retries</div>
+            </div>
+            <div class="stat-card testing">
+                <div class="value">{success_fail_stats.get('avg_retries', 0.0)}</div>
+                <div class="label">Avg Retries/Feature</div>
             </div>
         </div>
 

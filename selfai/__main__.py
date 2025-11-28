@@ -141,7 +141,7 @@ def show_status():
     if plist_path.exists():
         print(f"\nLaunchAgent: Installed (runs every 3 minutes)")
     else:
-        print(f"\nLaunchAgent: Not installed (run 'python -m _selfai install')")
+        print(f"\nLaunchAgent: Not installed (run 'python -m selfai install')")
 
 
 def open_dashboard():
@@ -149,10 +149,9 @@ def open_dashboard():
     repo_path = get_repo_root()
     dashboard_path = repo_path / '.selfai_data' / 'dashboard.html'
 
-    if not dashboard_path.exists():
-        # Generate dashboard first
-        runner = Runner(repo_path)
-        runner.update_dashboard()
+    # Always regenerate dashboard with latest stats
+    runner = Runner(repo_path)
+    runner.update_dashboard()
 
     webbrowser.open(f'file://{dashboard_path}')
     print(f"Opened dashboard: {dashboard_path}")
@@ -227,32 +226,49 @@ def add_improvement(title: str, description: str = '', category: str = 'general'
 def test_feature(feature_id: int, verbose: bool = False):
     """Test a specific feature by ID."""
     repo_path = get_repo_root()
-    runner = Runner(repo_path)
+
+    try:
+        runner = Runner(repo_path)
+    except Exception as e:
+        print(f"Error initializing runner: {e}")
+        if verbose:
+            import traceback
+            traceback.print_exc()
+        return
 
     can_test, reason = runner.db.can_test_feature(feature_id)
     if not can_test:
-        print(f"Cannot test feature #{feature_id}: {reason}")
+        print(f"\nError: Cannot test feature #{feature_id}")
+        print(f"Reason: {reason}")
+        print("\nTroubleshooting:")
+        print("  - Check that the feature exists with: python -m selfai status")
+        print("  - Ensure feature has been implemented (status should be 'testing' or 'in_progress')")
+        print("  - Verify retry count hasn't exceeded maximum (3)")
         return
 
     feature = runner.db.get_by_id(feature_id)
     if not feature:
-        print(f"Feature #{feature_id} not found")
+        print(f"\nError: Feature #{feature_id} not found in database")
+        print("\nUse 'python -m selfai status' to see available features")
         return
 
     retry_count = feature.get('retry_count', 0)
     level = feature.get('current_level', 1)
     level_name = {1: 'MVP', 2: 'Enhanced', 3: 'Advanced'}[level]
+    max_retries = 3
 
     print(f"\nTesting Feature #{feature_id}")
     print(f"  Title: {feature['title']}")
     print(f"  Level: {level_name} ({level}/3)")
-    print(f"  Retry: {retry_count}/3")
+    print(f"  Retry: {retry_count}/{max_retries}")
     print(f"  Status: {feature['status']}")
 
     if verbose:
         print(f"\n  Description: {feature.get('description', 'N/A')}")
         print(f"  Category: {feature.get('category', 'N/A')}")
         print(f"  Priority: {feature.get('priority', 'N/A')}")
+        if feature.get('error'):
+            print(f"  Last Error: {feature['error']}")
 
     print("\nRunning tests...")
 
@@ -266,14 +282,44 @@ def test_feature(feature_id: int, verbose: bool = False):
 
             print(f"\nTest Result: {test_status.upper()}")
 
+            if test_status == 'failed':
+                new_retry = updated.get('retry_count', 0)
+                if new_retry >= max_retries:
+                    print(f"  Status: Max retries reached - feature marked as permanently failed")
+                    print(f"  Action: Review test output and implementation before re-enabling")
+                else:
+                    print(f"  Status: Will retry (attempt {new_retry + 1}/{max_retries})")
+                    print(f"  Action: Feature moved back to pending queue")
+            elif test_status == 'passed':
+                print(f"  Status: Feature completed successfully at {level_name} level")
+                if level < 3:
+                    print(f"  Action: Can optionally enhance to level {level + 1}")
+
             if verbose and updated.get(f'{level_col}_test_output'):
                 print(f"\nTest Output:")
-                print(updated.get(f'{level_col}_test_output')[:500])
+                output = updated.get(f'{level_col}_test_output', '')
+                if len(output) > 1000:
+                    print(output[:1000])
+                    print(f"\n... (truncated, {len(output)} total characters)")
+                else:
+                    print(output)
         else:
-            print("Error: Could not retrieve updated feature status")
+            print("\nError: Could not retrieve updated feature status")
+            print("Database may be corrupted or locked")
 
+    except KeyboardInterrupt:
+        print("\n\nTest interrupted by user")
+        print("Feature will remain in current state")
     except Exception as e:
-        print(f"Error running tests: {e}")
+        print(f"\nError running tests: {e}")
+        print("\nPossible causes:")
+        print("  - Claude API connection issues")
+        print("  - Missing worktree or implementation files")
+        print("  - Database access problems")
+        if verbose:
+            print("\nFull traceback:")
+            import traceback
+            traceback.print_exc()
 
 
 def print_help():
@@ -282,10 +328,10 @@ def print_help():
 SelfAI - Autonomous Self-Improving System with MVP Testing & Progressive Complexity
 
 Usage:
-    python -m _selfai <command> [options]
+    python -m selfai <command> [options]
 
 Commands:
-    install      Install LaunchAgent (runs every 5 minutes)
+    install      Install LaunchAgent (runs every 3 minutes)
     uninstall    Remove LaunchAgent
     run          Run a single improvement cycle (includes testing)
     status       Show current status with complexity & test stats
@@ -307,16 +353,16 @@ Run Cycle:
     4. Discover new improvements (if queue empty)
 
 Examples:
-    python -m _selfai install                  # Start autonomous improvements
-    python -m _selfai run                      # Run once manually
-    python -m _selfai status                   # Check progress & test status
-    python -m _selfai dashboard                # View in browser
-    python -m _selfai analyze-logs             # Check for errors in logs
-    python -m _selfai add "Fix bug X"          # Add MVP-level task
-    python -m _selfai test 5                   # Test feature #5
-    python -m _selfai test 5 --verbose         # Test feature #5 with detailed output
-    python -m _selfai add "Feature" "" "" 80 2 # Add Enhanced task (priority 80)
-    python -m _selfai uninstall                # Stop autonomous runs
+    python -m selfai install                  # Start autonomous improvements
+    python -m selfai run                      # Run once manually
+    python -m selfai status                   # Check progress & test status
+    python -m selfai dashboard                # View in browser
+    python -m selfai analyze-logs             # Check for errors in logs
+    python -m selfai add "Fix bug X"          # Add MVP-level task
+    python -m selfai test 5                   # Test feature #5
+    python -m selfai test 5 --verbose         # Test feature #5 with detailed output
+    python -m selfai add "Feature" "" "" 80 2 # Add Enhanced task (priority 80)
+    python -m selfai uninstall                # Stop autonomous runs
 """)
 
 
@@ -342,7 +388,7 @@ def main():
         analyze_logs()
     elif command == 'add':
         if len(sys.argv) < 3:
-            print("Usage: python -m _selfai add \"title\" [description] [category] [priority]")
+            print("Usage: python -m selfai add \"title\" [description] [category] [priority]")
             return
         title = sys.argv[2]
         description = sys.argv[3] if len(sys.argv) > 3 else ''
@@ -351,7 +397,7 @@ def main():
         add_improvement(title, description, category, priority)
     elif command == 'test':
         if len(sys.argv) < 3:
-            print("Usage: python -m _selfai test <feature_id> [--verbose]")
+            print("Usage: python -m selfai test <feature_id> [--verbose]")
             return
         try:
             feature_id = int(sys.argv[2])

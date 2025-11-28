@@ -22,7 +22,7 @@ def init_git_repo(path: Path):
 
 def test_parse_test_result_pass_json():
     """Test that _parse_test_result correctly identifies pass from JSON."""
-    from _selfai.runner import Runner
+    from selfai.runner import Runner
 
     test_dir = tempfile.mkdtemp()
     try:
@@ -60,7 +60,7 @@ def test_parse_test_result_pass_json():
 
 def test_parse_test_result_fail_json():
     """Test that _parse_test_result correctly identifies fail from JSON."""
-    from _selfai.runner import Runner
+    from selfai.runner import Runner
 
     test_dir = tempfile.mkdtemp()
     try:
@@ -98,7 +98,7 @@ def test_parse_test_result_fail_json():
 
 def test_parse_test_result_heuristic():
     """Test fallback heuristic parsing for non-JSON output."""
-    from _selfai.runner import Runner
+    from selfai.runner import Runner
 
     test_dir = tempfile.mkdtemp()
     try:
@@ -136,7 +136,7 @@ def test_parse_test_result_heuristic():
 
 def test_mark_test_passed():
     """Test that mark_test_passed correctly updates database."""
-    from _selfai.database import Database
+    from selfai.database import Database
 
     test_dir = tempfile.mkdtemp()
     try:
@@ -185,7 +185,7 @@ def test_mark_test_passed():
 
 def test_mark_test_failed():
     """Test that mark_test_failed correctly updates database and increments retry."""
-    from _selfai.database import Database
+    from selfai.database import Database
 
     test_dir = tempfile.mkdtemp()
     try:
@@ -243,7 +243,7 @@ def test_mark_test_failed():
 
 def test_get_test_criteria():
     """Test that test criteria is returned for each level."""
-    from _selfai.runner import Runner
+    from selfai.runner import Runner
 
     test_dir = tempfile.mkdtemp()
     try:
@@ -289,7 +289,7 @@ def test_get_test_criteria():
 
 def test_cli_test_command_exists():
     """Test that the test command exists in CLI."""
-    from _selfai.__main__ import main, test_feature
+    from selfai.__main__ import main, test_feature
 
     # Check that test_feature function exists and is callable
     if callable(test_feature):

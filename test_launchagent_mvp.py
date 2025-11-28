@@ -10,7 +10,7 @@ import xml.etree.ElementTree as ET
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
-from _selfai.__main__ import install_launchagent, uninstall_launchagent, get_repo_root
+from selfai.__main__ import install_launchagent, uninstall_launchagent, get_repo_root
 
 
 def test_install_launchagent_creates_plist():
@@ -19,15 +19,15 @@ def test_install_launchagent_creates_plist():
         # Setup mock paths
         repo_path = Path(tmpdir) / 'test_repo'
         repo_path.mkdir()
-        (repo_path / '_selfai').mkdir()
+        (repo_path / 'selfai').mkdir()
 
         home_dir = Path(tmpdir) / 'home'
         home_dir.mkdir()
         launch_agents_dir = home_dir / 'Library' / 'LaunchAgents'
         launch_agents_dir.mkdir(parents=True)
 
-        with patch('_selfai.__main__.get_repo_root', return_value=repo_path):
-            with patch('_selfai.__main__.Path.home', return_value=home_dir):
+        with patch('selfai.__main__.get_repo_root', return_value=repo_path):
+            with patch('selfai.__main__.Path.home', return_value=home_dir):
                 with patch('subprocess.run') as mock_run:
                     # Mock successful launchctl load
                     mock_run.return_value = MagicMock(returncode=0, stderr='')
@@ -51,15 +51,15 @@ def test_plist_content_valid():
     with tempfile.TemporaryDirectory() as tmpdir:
         repo_path = Path(tmpdir) / 'test_repo'
         repo_path.mkdir()
-        (repo_path / '_selfai').mkdir()
+        (repo_path / 'selfai').mkdir()
 
         home_dir = Path(tmpdir) / 'home'
         home_dir.mkdir()
         launch_agents_dir = home_dir / 'Library' / 'LaunchAgents'
         launch_agents_dir.mkdir(parents=True)
 
-        with patch('_selfai.__main__.get_repo_root', return_value=repo_path):
-            with patch('_selfai.__main__.Path.home', return_value=home_dir):
+        with patch('selfai.__main__.get_repo_root', return_value=repo_path):
+            with patch('selfai.__main__.Path.home', return_value=home_dir):
                 with patch('subprocess.run') as mock_run:
                     mock_run.return_value = MagicMock(returncode=0, stderr='')
 
@@ -92,7 +92,7 @@ def test_uninstall_launchagent_removes_plist():
     with tempfile.TemporaryDirectory() as tmpdir:
         repo_path = Path(tmpdir) / 'test_repo'
         repo_path.mkdir()
-        (repo_path / '_selfai').mkdir()
+        (repo_path / 'selfai').mkdir()
 
         home_dir = Path(tmpdir) / 'home'
         home_dir.mkdir()
@@ -105,8 +105,8 @@ def test_uninstall_launchagent_removes_plist():
 
         assert plist_path.exists(), "Plist should exist before uninstall"
 
-        with patch('_selfai.__main__.get_repo_root', return_value=repo_path):
-            with patch('_selfai.__main__.Path.home', return_value=home_dir):
+        with patch('selfai.__main__.get_repo_root', return_value=repo_path):
+            with patch('selfai.__main__.Path.home', return_value=home_dir):
                 with patch('subprocess.run') as mock_run:
                     uninstall_launchagent()
 
@@ -124,7 +124,7 @@ def test_logs_directory_created():
     with tempfile.TemporaryDirectory() as tmpdir:
         repo_path = Path(tmpdir) / 'test_repo'
         repo_path.mkdir()
-        (repo_path / '_selfai').mkdir()
+        (repo_path / 'selfai').mkdir()
 
         home_dir = Path(tmpdir) / 'home'
         home_dir.mkdir()
@@ -134,8 +134,8 @@ def test_logs_directory_created():
         logs_dir = repo_path / '.selfai_data' / 'logs'
         assert not logs_dir.exists(), "Logs directory should not exist initially"
 
-        with patch('_selfai.__main__.get_repo_root', return_value=repo_path):
-            with patch('_selfai.__main__.Path.home', return_value=home_dir):
+        with patch('selfai.__main__.get_repo_root', return_value=repo_path):
+            with patch('selfai.__main__.Path.home', return_value=home_dir):
                 with patch('subprocess.run') as mock_run:
                     mock_run.return_value = MagicMock(returncode=0, stderr='')
 
