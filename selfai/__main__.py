@@ -313,6 +313,68 @@ def show_plan(task_id: int):
         print(task['user_feedback'])
 
 
+def analyze_logs():
+    """Analyze logs for errors and issues."""
+    from .runner import LogAnalyzer, CLAUDE_CMD
+    repo_path = get_repo_root()
+    data_dir = repo_path / '.selfai_data'
+
+    analyzer = LogAnalyzer(data_dir, CLAUDE_CMD)
+    analysis = analyzer.analyze_logs()
+
+    print(f"\n=== Log Analysis ===")
+    print(f"Analyzed {analysis['log_lines']} log lines")
+    print(f"Found {analysis['issues_found']} issues\n")
+
+    if analysis['issues']:
+        print("Issues:")
+        print("-" * 70)
+        for i, issue in enumerate(analysis['issues'][:10], 1):
+            issue_type = issue['type'].upper()
+            detail = issue['detail'][:60]
+            print(f"  {i}. [{issue_type}] {detail}")
+            if len(issue['detail']) > 60:
+                print(f"     {'...'}")
+
+        if len(analysis['issues']) > 10:
+            print(f"\n... and {len(analysis['issues']) - 10} more issues")
+
+        print("\nUse 'python -m selfai diagnose' to run diagnosis on these issues")
+    else:
+        print("No issues found in logs.")
+
+
+def diagnose_issues():
+    """Diagnose issues found in logs."""
+    from .runner import LogAnalyzer, CLAUDE_CMD
+    repo_path = get_repo_root()
+    data_dir = repo_path / '.selfai_data'
+
+    analyzer = LogAnalyzer(data_dir, CLAUDE_CMD)
+    analysis = analyzer.analyze_logs()
+
+    if not analysis['issues']:
+        print("No issues found in logs.")
+        return
+
+    print(f"\n=== Diagnosing {len(analysis['issues'])} issues ===\n")
+
+    for i, issue in enumerate(analysis['issues'][:3], 1):
+        print(f"{i}. Diagnosing [{issue['type'].upper()}]: {issue['detail'][:50]}...")
+        try:
+            diagnosis = analyzer.diagnose_and_fix(issue, repo_path)
+            print(f"   Diagnosis: {diagnosis.get('diagnosis', 'N/A')[:80]}")
+            print(f"   Confidence: {diagnosis.get('confidence', 0):.2f}")
+            if diagnosis.get('fix_description'):
+                print(f"   Fix: {diagnosis.get('fix_description', '')[:80]}")
+            print()
+        except Exception as e:
+            print(f"   Error: {e}\n")
+
+    if len(analysis['issues']) > 3:
+        print(f"Diagnosed first 3 issues. {len(analysis['issues']) - 3} remaining.")
+
+
 def show_monitoring_stats():
     """Show monitoring and self-healing statistics."""
     import sqlite3
@@ -392,6 +454,8 @@ Commands:
                      refactoring, documentation, performance, code_quality)
     status           Show current status with tasks awaiting review
     monitor          Show self-healing monitoring statistics
+    analyze-logs     Analyze system logs for errors and patterns
+    diagnose         Diagnose issues found in logs using AI
     dashboard        Open dashboard in browser (starts server)
     serve [port]     Start dashboard server only (default port: 8787)
     add "title"      Add a new improvement task
@@ -514,6 +578,10 @@ def main():
             print("Error: task_id must be a number")
     elif command == 'monitor':
         show_monitoring_stats()
+    elif command == 'analyze-logs':
+        analyze_logs()
+    elif command == 'diagnose':
+        diagnose_issues()
     elif command in ('help', '-h', '--help'):
         print_help()
     else:

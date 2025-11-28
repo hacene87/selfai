@@ -148,6 +148,28 @@ class Database:
                 'ALTER TABLE improvements ADD COLUMN original_plan_id INTEGER',
                 'ALTER TABLE improvements ADD COLUMN discovery_timestamp TEXT',
                 'ALTER TABLE improvements ADD COLUMN confidence_score REAL DEFAULT 0.5',
+                # Worktree tracking columns
+                'ALTER TABLE improvements ADD COLUMN worktree_path TEXT',
+                'ALTER TABLE improvements ADD COLUMN branch_name TEXT',
+                'ALTER TABLE improvements ADD COLUMN merge_conflicts TEXT',
+                # 3-level complexity system columns
+                'ALTER TABLE improvements ADD COLUMN current_level INTEGER DEFAULT 1',
+                'ALTER TABLE improvements ADD COLUMN mvp_status TEXT DEFAULT "pending"',
+                'ALTER TABLE improvements ADD COLUMN mvp_output TEXT',
+                'ALTER TABLE improvements ADD COLUMN mvp_test_output TEXT',
+                'ALTER TABLE improvements ADD COLUMN mvp_test_count INTEGER DEFAULT 0',
+                'ALTER TABLE improvements ADD COLUMN enhanced_status TEXT DEFAULT "locked"',
+                'ALTER TABLE improvements ADD COLUMN enhanced_output TEXT',
+                'ALTER TABLE improvements ADD COLUMN enhanced_test_output TEXT',
+                'ALTER TABLE improvements ADD COLUMN enhanced_test_count INTEGER DEFAULT 0',
+                'ALTER TABLE improvements ADD COLUMN advanced_status TEXT DEFAULT "locked"',
+                'ALTER TABLE improvements ADD COLUMN advanced_output TEXT',
+                'ALTER TABLE improvements ADD COLUMN advanced_test_output TEXT',
+                'ALTER TABLE improvements ADD COLUMN advanced_test_count INTEGER DEFAULT 0',
+                # Log analysis and diagnostics columns
+                'ALTER TABLE improvements ADD COLUMN diagnosed_issues INTEGER DEFAULT 0',
+                'ALTER TABLE improvements ADD COLUMN auto_fixed_issues INTEGER DEFAULT 0',
+                'ALTER TABLE improvements ADD COLUMN diagnostic_confidence REAL DEFAULT 0.0',
             ]
 
             for migration in migrations:
@@ -158,6 +180,21 @@ class Database:
 
             conn.execute('CREATE INDEX IF NOT EXISTS idx_status ON improvements(status)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_priority ON improvements(priority)')
+
+            # Create level_unlocks table for global unlock tracking
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS level_unlocks (
+                    level TEXT PRIMARY KEY,
+                    unlocked_at TEXT,
+                    required_count INTEGER,
+                    completed_count INTEGER DEFAULT 0
+                )
+            ''')
+
+            # Initialize unlock requirements
+            conn.execute('INSERT OR IGNORE INTO level_unlocks VALUES ("enhanced", NULL, 5, 0)')
+            conn.execute('INSERT OR IGNORE INTO level_unlocks VALUES ("advanced", NULL, 10, 0)')
+
             conn.commit()
 
     @contextmanager
@@ -393,6 +430,36 @@ class Database:
             conn.commit()
             return True
 
+    def record_diagnosis(self, imp_id: int, confidence: float, fixed: bool = False) -> bool:
+        """Record diagnostic attempt for log analysis.
+
+        Args:
+            imp_id: Improvement ID
+            confidence: Diagnostic confidence score (0.0-1.0)
+            fixed: Whether the issue was auto-fixed
+
+        Returns:
+            True if successful
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            if fixed:
+                conn.execute('''
+                    UPDATE improvements
+                    SET diagnosed_issues = diagnosed_issues + 1,
+                        auto_fixed_issues = auto_fixed_issues + 1,
+                        diagnostic_confidence = ?
+                    WHERE id = ?
+                ''', (confidence, imp_id))
+            else:
+                conn.execute('''
+                    UPDATE improvements
+                    SET diagnosed_issues = diagnosed_issues + 1,
+                        diagnostic_confidence = ?
+                    WHERE id = ?
+                ''', (confidence, imp_id))
+            conn.commit()
+            return True
+
     def re_enable_cancelled(self, imp_id: int, feedback: str = '') -> bool:
         """Re-enable a cancelled task with optional feedback."""
         with sqlite3.connect(self.db_path) as conn:
@@ -530,4 +597,261 @@ class Database:
             ''')
             for row in cursor.fetchall():
                 stats[row[0]] = row[1]
+            return stats
+
+    def set_worktree_info(self, imp_id: int, worktree_path: str, branch_name: str) -> bool:
+        """Store worktree metadata for task.
+
+        Args:
+            imp_id: Improvement ID
+            worktree_path: Path to worktree
+            branch_name: Git branch name
+
+        Returns:
+            True if successful
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                'UPDATE improvements SET worktree_path = ?, branch_name = ? WHERE id = ?',
+                (worktree_path, branch_name, imp_id)
+            )
+            conn.commit()
+            logger.info(f"Worktree info saved for #{imp_id}: {branch_name}")
+            return True
+
+    def record_merge_conflict(self, imp_id: int, conflicted_files: List[str]) -> bool:
+        """Record merge conflict details.
+
+        Args:
+            imp_id: Improvement ID
+            conflicted_files: List of files with conflicts
+
+        Returns:
+            True if successful
+        """
+        conflict_str = json.dumps(conflicted_files)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                'UPDATE improvements SET merge_conflicts = ? WHERE id = ?',
+                (conflict_str, imp_id)
+            )
+            conn.commit()
+            logger.warning(f"Recorded merge conflicts for #{imp_id}: {len(conflicted_files)} files")
+            return True
+
+    def clear_worktree_info(self, imp_id: int) -> bool:
+        """Clear worktree metadata after cleanup.
+
+        Args:
+            imp_id: Improvement ID
+
+        Returns:
+            True if successful
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                'UPDATE improvements SET worktree_path = NULL, branch_name = NULL WHERE id = ?',
+                (imp_id,)
+            )
+            conn.commit()
+            return True
+
+    # 3-Level Complexity System Methods
+
+    def is_level_unlocked(self, level: int) -> tuple[bool, str]:
+        """Check if a level is unlocked globally."""
+        if level == 1:
+            return True, 'MVP level is always available'
+
+        with sqlite3.connect(self.db_path) as conn:
+            level_name = 'enhanced' if level == 2 else 'advanced'
+            cursor = conn.execute(
+                'SELECT unlocked_at, required_count, completed_count FROM level_unlocks WHERE level = ?',
+                (level_name,)
+            )
+            row = cursor.fetchone()
+            if row and row[0]:  # unlocked_at is set
+                return True, f'{level_name.title()} level unlocked!'
+            elif row:
+                return False, f'{level_name.title()} requires {row[1]} tested features at previous level ({row[2]}/{row[1]} complete)'
+            return False, 'Unknown level'
+
+    def check_and_unlock_levels(self):
+        """Check if any levels should be unlocked based on completed features."""
+        with sqlite3.connect(self.db_path) as conn:
+            # Count features with passed MVP tests
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM improvements WHERE mvp_status = 'completed'"
+            )
+            mvp_completed = cursor.fetchone()[0]
+
+            # Count features with passed Enhanced tests
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM improvements WHERE enhanced_status = 'completed'"
+            )
+            enhanced_completed = cursor.fetchone()[0]
+
+            # Update counts and unlock if thresholds met
+            conn.execute(
+                'UPDATE level_unlocks SET completed_count = ? WHERE level = ?',
+                (mvp_completed, 'enhanced')
+            )
+            conn.execute(
+                'UPDATE level_unlocks SET completed_count = ? WHERE level = ?',
+                (enhanced_completed, 'advanced')
+            )
+
+            # Check Enhanced unlock (5 MVPs)
+            if mvp_completed >= 5:
+                conn.execute(
+                    'UPDATE level_unlocks SET unlocked_at = ? WHERE level = ? AND unlocked_at IS NULL',
+                    (datetime.now().isoformat(), 'enhanced')
+                )
+
+            # Check Advanced unlock (10 Enhanced)
+            if enhanced_completed >= 10:
+                conn.execute(
+                    'UPDATE level_unlocks SET unlocked_at = ? WHERE level = ? AND unlocked_at IS NULL',
+                    (datetime.now().isoformat(), 'advanced')
+                )
+
+            conn.commit()
+
+    def get_features_for_level(self, level: int, limit: int = MAX_PARALLEL_TASKS) -> List[Dict]:
+        """Get features ready for implementation at a specific level."""
+        level_status_col = {1: 'mvp_status', 2: 'enhanced_status', 3: 'advanced_status'}[level]
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            # Features at this level that are approved/ready
+            cursor = conn.execute(f'''
+                SELECT * FROM improvements
+                WHERE current_level = ? AND {level_status_col} = 'approved'
+                AND status != 'cancelled'
+                ORDER BY priority DESC
+                LIMIT ?
+            ''', (level, limit))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def advance_to_next_level(self, imp_id: int) -> bool:
+        """Advance a feature to the next level after passing tests."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute('SELECT current_level FROM improvements WHERE id = ?', (imp_id,))
+            row = cursor.fetchone()
+            if not row:
+                return False
+
+            current = row[0]
+            if current >= 3:
+                return False  # Already at max level
+
+            next_level = current + 1
+            next_status_col = {2: 'enhanced_status', 3: 'advanced_status'}[next_level]
+
+            conn.execute(f'''
+                UPDATE improvements
+                SET current_level = ?, {next_status_col} = 'pending'
+                WHERE id = ?
+            ''', (next_level, imp_id))
+            conn.commit()
+            return True
+
+    def mark_level_completed(self, imp_id: int, level: int, output: str) -> bool:
+        """Mark a level's implementation as complete, ready for testing."""
+        cols = {1: ('mvp_status', 'mvp_output'), 2: ('enhanced_status', 'enhanced_output'), 3: ('advanced_status', 'advanced_output')}
+        status_col, output_col = cols[level]
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(f'''
+                UPDATE improvements SET {status_col} = 'testing', {output_col} = ?
+                WHERE id = ?
+            ''', (output, imp_id))
+            conn.commit()
+            return True
+
+    def mark_level_test_passed(self, imp_id: int, level: int, test_output: str) -> bool:
+        """Mark a level's tests as passed."""
+        cols = {1: ('mvp_status', 'mvp_test_output'), 2: ('enhanced_status', 'enhanced_test_output'), 3: ('advanced_status', 'advanced_test_output')}
+        status_col, test_col = cols[level]
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(f'''
+                UPDATE improvements SET {status_col} = 'completed', {test_col} = ?
+                WHERE id = ?
+            ''', (test_output, imp_id))
+            conn.commit()
+
+            # Check if feature is fully complete (all 3 levels)
+            if level == 3:
+                conn.execute('''
+                    UPDATE improvements SET status = 'completed', completed_at = ?
+                    WHERE id = ?
+                ''', (datetime.now().isoformat(), imp_id))
+                conn.commit()
+
+            # Check if any new levels should be unlocked
+            self.check_and_unlock_levels()
+            return True
+
+    def get_pending_planning_for_level(self, level: int, limit: int = MAX_PARALLEL_TASKS) -> List[Dict]:
+        """Get features that need planning at a specific level."""
+        level_status_col = {1: 'mvp_status', 2: 'enhanced_status', 3: 'advanced_status'}[level]
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(f'''
+                SELECT * FROM improvements
+                WHERE current_level = ? AND {level_status_col} = 'pending'
+                AND status != 'cancelled'
+                ORDER BY priority DESC, created_at ASC
+                LIMIT ?
+            ''', (level, limit))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_features_for_testing_at_level(self, level: int, limit: int = MAX_PARALLEL_TASKS) -> List[Dict]:
+        """Get features that need testing at a specific level."""
+        level_status_col = {1: 'mvp_status', 2: 'enhanced_status', 3: 'advanced_status'}[level]
+        level_test_count_col = {1: 'mvp_test_count', 2: 'enhanced_test_count', 3: 'advanced_test_count'}[level]
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(f'''
+                SELECT * FROM improvements
+                WHERE current_level = ? AND {level_status_col} = 'testing'
+                AND {level_test_count_col} < ?
+                AND status != 'cancelled'
+                ORDER BY priority DESC
+                LIMIT ?
+            ''', (level, MAX_TEST_ATTEMPTS, limit))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_stats_by_level(self) -> Dict:
+        """Get statistics grouped by level."""
+        with sqlite3.connect(self.db_path) as conn:
+            stats = {}
+            for level_name in ['MVP', 'Enhanced', 'Advanced']:
+                level_num = {'MVP': 1, 'Enhanced': 2, 'Advanced': 3}[level_name]
+                status_col = level_name.lower() + '_status'
+
+                cursor = conn.execute(f'''
+                    SELECT COUNT(*) FROM improvements WHERE {status_col} = 'completed'
+                ''')
+                completed = cursor.fetchone()[0]
+
+                cursor = conn.execute(f'''
+                    SELECT COUNT(*) FROM improvements WHERE {status_col} IN ('testing', 'approved')
+                ''')
+                in_progress = cursor.fetchone()[0]
+
+                cursor = conn.execute(f'''
+                    SELECT COUNT(*) FROM improvements WHERE {status_col} = 'pending' AND current_level = ?
+                ''', (level_num,))
+                pending = cursor.fetchone()[0]
+
+                stats[level_name] = {
+                    'completed': completed,
+                    'in_progress': in_progress,
+                    'pending': pending
+                }
+
             return stats
