@@ -404,9 +404,11 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
             plan = task.get('plan_content', '') or ''
             plan_preview = plan[:100].replace('"', '&quot;').replace('<', '&lt;').replace('\n', ' ')
 
-            # Store plan data for JavaScript - json.dumps handles escaping
+            # Store plan data for JavaScript - escape </script> to prevent breaking HTML
             if plan:
-                plans_data[task['id']] = plan
+                # Must escape </script> or it will close the script tag prematurely
+                safe_plan = plan.replace('</script>', '<\\/script>')
+                plans_data[task['id']] = safe_plan
 
             # Action buttons based on status
             actions = ''
@@ -636,44 +638,26 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
         </div>
     </div>
 
-    <!-- Toast notification -->
-    <div id="toast" style="display:none; position:fixed; bottom:30px; left:50%; transform:translateX(-50%); background:#22c55e; color:white; padding:15px 30px; border-radius:10px; box-shadow:0 4px 15px rgba(0,0,0,0.3); z-index:1000; font-weight:bold;">
-        Command copied! Paste in terminal.
-    </div>
-
     <script>
         let currentTaskId = null;
         const plans = {json.dumps(plans_data)};
 
-        function showToast(message, isSuccess) {{
-            const toast = document.getElementById('toast');
-            toast.textContent = message;
-            toast.style.background = isSuccess ? '#22c55e' : '#f59e0b';
-            toast.style.display = 'block';
-            setTimeout(() => toast.style.display = 'none', 3000);
-        }}
-
-        function copyToClipboard(text) {{
-            navigator.clipboard.writeText(text).then(() => {{
-                showToast('Command copied! Paste in terminal.', true);
-            }}).catch(() => {{
-                // Fallback for older browsers
-                const ta = document.createElement('textarea');
-                ta.value = text;
-                document.body.appendChild(ta);
-                ta.select();
-                document.execCommand('copy');
-                document.body.removeChild(ta);
-                showToast('Command copied! Paste in terminal.', true);
-            }});
+        function showCommand(cmd) {{
+            // Use prompt() which works on file:// protocol
+            window.prompt('Copy this command (Ctrl+C or Cmd+C):', cmd);
         }}
 
         function showPlan(id) {{
             const plan = plans[id];
-            if (plan) {{
-                document.getElementById('planTitle').textContent = 'Plan for Task #' + id;
-                document.getElementById('planContent').textContent = plan;
-                document.getElementById('planModal').style.display = 'flex';
+            const modal = document.getElementById('planModal');
+            const title = document.getElementById('planTitle');
+            const content = document.getElementById('planContent');
+            if (plan && modal && title && content) {{
+                title.textContent = 'Plan for Task #' + id;
+                content.textContent = plan;
+                modal.style.display = 'flex';
+            }} else {{
+                alert('Plan not found for task #' + id);
             }}
         }}
 
@@ -682,8 +666,7 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
         }}
 
         function approvePlan(id) {{
-            const cmd = 'python -m selfai approve ' + id;
-            copyToClipboard(cmd);
+            showCommand('python -m selfai approve ' + id);
         }}
 
         function showFeedback(id) {{
@@ -697,15 +680,23 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
 
         function submitFeedback() {{
             const feedback = document.getElementById('feedbackText').value;
-            const cmd = 'python -m selfai feedback ' + currentTaskId + ' "' + feedback.replace(/"/g, '\\\\"') + '"';
-            copyToClipboard(cmd);
+            if (feedback) {{
+                const cmd = 'python -m selfai feedback ' + currentTaskId + ' "' + feedback.replace(/"/g, '\\\\"') + '"';
+                showCommand(cmd);
+            }}
             closeModal();
         }}
 
         function reEnable(id) {{
-            const cmd = 'python -m selfai reenable ' + id;
-            copyToClipboard(cmd);
+            showCommand('python -m selfai reenable ' + id);
         }}
+
+        // Close modals when clicking outside
+        document.addEventListener('click', function(e) {{
+            if (e.target.classList.contains('modal')) {{
+                e.target.style.display = 'none';
+            }}
+        }});
     </script>
 </body>
 </html>'''
