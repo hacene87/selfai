@@ -137,6 +137,33 @@ def test_stats_retrieval():
         db_path.unlink()
 
 
+def test_database_initialization():
+    """Test that database schema is created correctly."""
+    with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp:
+        db_path = Path(tmp.name)
+
+    try:
+        db = Database(db_path)
+
+        # Verify database file exists
+        assert db_path.exists(), "Database file should exist"
+
+        # Verify we can perform operations
+        imp_id = db.add("Test", "Test")
+        assert imp_id > 0
+
+        # Verify schema by checking required columns
+        imp = db.get_by_id(imp_id)
+        required_fields = ['id', 'title', 'description', 'status', 'plan_content',
+                          'plan_status', 'created_at', 'test_count']
+        for field in required_fields:
+            assert field in imp, f"Missing field: {field}"
+
+        return True
+    finally:
+        db_path.unlink()
+
+
 def main():
     """Run all tests and report results."""
     tests = [
@@ -144,6 +171,7 @@ def main():
         ("Status Transitions", test_status_transitions),
         ("Plan Storage", test_plan_storage),
         ("Stats Retrieval", test_stats_retrieval),
+        ("Database Initialization", test_database_initialization),
     ]
 
     print("=" * 60)
