@@ -559,10 +559,15 @@ class WorktreeManager:
                     raise WorktreeError(f"Merge failed for feature #{feature_id}: {output}")
 
             # Push to remote (if configured)
-            success, output = self._run_git('push', retry=False)
+            success, output = self._run_git('push', 'origin', 'main', retry=False)
             if not success:
                 logger.warning(f"Push failed (may be no remote configured): {output}")
-                # Don't fail merge if push fails - might be offline
+                # Retry with just 'push' in case origin isn't set up
+                success, output = self._run_git('push', retry=False)
+                if success:
+                    logger.info(f"Push succeeded on retry")
+                else:
+                    logger.warning(f"Push retry also failed - changes are local only")
 
             # Cleanup branch
             success, output = self._run_git('branch', '-d', branch_name, retry=False)
