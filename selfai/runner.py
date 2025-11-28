@@ -404,9 +404,9 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
             plan = task.get('plan_content', '') or ''
             plan_preview = plan[:100].replace('"', '&quot;').replace('<', '&lt;').replace('\n', ' ')
 
-            # Store plan data for JavaScript
+            # Store plan data for JavaScript - json.dumps handles escaping
             if plan:
-                plans_data[task['id']] = plan.replace('\\', '\\\\').replace('`', '\\`').replace('${', '\\${')
+                plans_data[task['id']] = plan
 
             # Action buttons based on status
             actions = ''
@@ -636,9 +636,37 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
         </div>
     </div>
 
+    <!-- Toast notification -->
+    <div id="toast" style="display:none; position:fixed; bottom:30px; left:50%; transform:translateX(-50%); background:#22c55e; color:white; padding:15px 30px; border-radius:10px; box-shadow:0 4px 15px rgba(0,0,0,0.3); z-index:1000; font-weight:bold;">
+        Command copied! Paste in terminal.
+    </div>
+
     <script>
         let currentTaskId = null;
         const plans = {json.dumps(plans_data)};
+
+        function showToast(message, isSuccess) {{
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.style.background = isSuccess ? '#22c55e' : '#f59e0b';
+            toast.style.display = 'block';
+            setTimeout(() => toast.style.display = 'none', 3000);
+        }}
+
+        function copyToClipboard(text) {{
+            navigator.clipboard.writeText(text).then(() => {{
+                showToast('Command copied! Paste in terminal.', true);
+            }}).catch(() => {{
+                // Fallback for older browsers
+                const ta = document.createElement('textarea');
+                ta.value = text;
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand('copy');
+                document.body.removeChild(ta);
+                showToast('Command copied! Paste in terminal.', true);
+            }});
+        }}
 
         function showPlan(id) {{
             const plan = plans[id];
@@ -654,11 +682,8 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
         }}
 
         function approvePlan(id) {{
-            if (confirm('Approve this plan for execution?')) {{
-                fetch(`/api/approve/${{id}}`, {{ method: 'POST' }})
-                    .then(() => location.reload())
-                    .catch(() => alert('Use CLI: python -m selfai approve ' + id));
-            }}
+            const cmd = 'python -m selfai approve ' + id;
+            copyToClipboard(cmd);
         }}
 
         function showFeedback(id) {{
@@ -672,20 +697,14 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
 
         function submitFeedback() {{
             const feedback = document.getElementById('feedbackText').value;
-            fetch(`/api/feedback/${{currentTaskId}}`, {{
-                method: 'POST',
-                body: JSON.stringify({{ feedback }})
-            }}).then(() => location.reload())
-              .catch(() => alert('Use CLI: python -m selfai feedback ' + currentTaskId + ' "' + feedback + '"'));
+            const cmd = 'python -m selfai feedback ' + currentTaskId + ' "' + feedback.replace(/"/g, '\\\\"') + '"';
+            copyToClipboard(cmd);
             closeModal();
         }}
 
         function reEnable(id) {{
-            if (confirm('Re-enable this cancelled task?')) {{
-                fetch(`/api/reenable/${{id}}`, {{ method: 'POST' }})
-                    .then(() => location.reload())
-                    .catch(() => alert('Use CLI: python -m selfai reenable ' + id));
-            }}
+            const cmd = 'python -m selfai reenable ' + id;
+            copyToClipboard(cmd);
         }}
     </script>
 </body>
