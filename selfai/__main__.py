@@ -8,6 +8,7 @@ from pathlib import Path
 from .runner import SelfAIRunner
 from .server import run_server
 from .healers import KnowledgeBase
+from .database import MAX_TEST_ATTEMPTS
 
 
 def get_repo_root() -> Path:
@@ -440,6 +441,46 @@ def show_monitoring_stats():
     print("\n" + "=" * 70)
 
 
+def show_levels():
+    """Show level unlock status."""
+    repo_path = get_repo_root()
+    runner = SelfAIRunner(repo_path)
+
+    print("\n=== Level Progression Status ===")
+
+    for level in [1, 2, 3]:
+        unlocked, msg = runner.db.is_level_unlocked(level)
+        name = ['MVP', 'Enhanced', 'Advanced'][level-1]
+        icon = '✓' if unlocked else '✗'
+        print(f"  {icon} Level {level} ({name}): {msg}")
+
+    print("\n=== Features by Level ===")
+    stats = runner.db.get_stats_by_level()
+    for level_name, counts in stats.items():
+        print(f"  {level_name}: {counts['completed']} complete, {counts['in_progress']} in progress, {counts['pending']} pending")
+
+
+def show_feature_progress(task_id: int):
+    """Show detailed level progress for a feature."""
+    repo_path = get_repo_root()
+    runner = SelfAIRunner(repo_path)
+    task = runner.db.get_by_id(task_id)
+
+    if not task:
+        print(f"Error: Task #{task_id} not found")
+        return
+
+    print(f"\n=== Feature #{task_id}: {task['title']} ===")
+    print(f"Current Level: {task.get('current_level', 1)}/3")
+
+    for level, name in [(1, 'MVP'), (2, 'Enhanced'), (3, 'Advanced')]:
+        status = task.get(f'{name.lower()}_status', 'locked')
+        test_count = task.get(f'{name.lower()}_test_count', 0)
+        icon_map = {'completed': '✓', 'testing': '🧪', 'approved': '✅', 'pending': '○', 'locked': '🔒'}
+        icon = icon_map.get(status, '?')
+        print(f"  {icon} {name}: {status} (tests: {test_count}/{MAX_TEST_ATTEMPTS})")
+
+
 def print_help():
     """Print usage help."""
     print("""
@@ -453,6 +494,8 @@ Commands:
     discover [cats]  Discover improvements (categories: security, test_coverage,
                      refactoring, documentation, performance, code_quality)
     status           Show current status with tasks awaiting review
+    levels           Show 3-level progression status (MVP/Enhanced/Advanced)
+    progress <id>    Show level progress for a specific feature
     monitor          Show self-healing monitoring statistics
     analyze-logs     Analyze system logs for errors and patterns
     diagnose         Diagnose issues found in logs using AI
@@ -574,6 +617,17 @@ def main():
         try:
             task_id = int(sys.argv[2])
             show_plan(task_id)
+        except ValueError:
+            print("Error: task_id must be a number")
+    elif command == 'levels':
+        show_levels()
+    elif command == 'progress':
+        if len(sys.argv) < 3:
+            print("Usage: python -m selfai progress <task_id>")
+            return
+        try:
+            task_id = int(sys.argv[2])
+            show_feature_progress(task_id)
         except ValueError:
             print("Error: task_id must be a number")
     elif command == 'monitor':
