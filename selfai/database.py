@@ -12,7 +12,7 @@ logger = logging.getLogger('selfai')
 MAX_TEST_ATTEMPTS = 3
 
 # Maximum parallel tasks
-MAX_PARALLEL_TASKS = 5
+MAX_PARALLEL_TASKS = 3
 
 # Status flow:
 # pending -> planning -> plan_review -> approved -> in_progress -> testing -> completed
