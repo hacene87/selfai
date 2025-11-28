@@ -207,7 +207,7 @@ Be thorough and detailed. This plan will be reviewed by a human before execution
                 [CLAUDE_CMD, '-p', prompt, '--allowedTools', 'WebSearch,WebFetch,Read,Glob,Grep'],
                 capture_output=True,
                 text=True,
-                timeout=300,
+                timeout=600,  # 10 minutes for complex plans
                 cwd=str(self.repo_path)
             )
 
