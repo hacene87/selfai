@@ -1403,6 +1403,24 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
             Planning-First Workflow | Max {MAX_PARALLEL_TASKS} Parallel | {MAX_TEST_ATTEMPTS} Test Attempts
         </p>
 
+        <div class="unlock-status">
+            <div class="unlock-card unlocked">
+                <span class="level-icon">1</span>
+                <span class="level-name">MVP</span>
+                <span class="status">✓ Unlocked</span>
+            </div>
+            <div class="unlock-card {'unlocked' if enhanced_unlocked else 'locked'}">
+                <span class="level-icon">2</span>
+                <span class="level-name">Enhanced</span>
+                <span class="status">{enhanced_msg}</span>
+            </div>
+            <div class="unlock-card {'unlocked' if advanced_unlocked else 'locked'}">
+                <span class="level-icon">3</span>
+                <span class="level-name">Advanced</span>
+                <span class="status">{advanced_msg}</span>
+            </div>
+        </div>
+
         <div class="stats">
             <div class="stat-card">
                 <div class="value" style="color: #f59e0b">{stats.get('plan_review', 0)}</div>
