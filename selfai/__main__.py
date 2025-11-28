@@ -1,20 +1,18 @@
-"""CLI entry point for SelfAI."""
+"""CLI entry point for SelfAI - Planning-First Workflow."""
 import sys
 import os
 import webbrowser
 import subprocess
 from pathlib import Path
 
-from .runner import Runner
+from .runner import SelfAIRunner
 
 
 def get_repo_root() -> Path:
-    """Get the repository root (parent of .selfai folder)."""
-    # Use current working directory to respect LaunchAgent's WorkingDirectory
+    """Get the repository root."""
     cwd = Path.cwd()
     if (cwd / 'selfai').exists():
         return cwd
-    # Fall back to __file__ location for direct execution
     return Path(__file__).parent.parent.resolve()
 
 
@@ -22,14 +20,10 @@ def install_launchagent():
     """Install macOS LaunchAgent for scheduled runs."""
     repo_path = get_repo_root()
     workspace_path = repo_path / '.selfai_data'
-
-    # Ensure workspace logs directory exists
     (workspace_path / 'logs').mkdir(parents=True, exist_ok=True)
 
-    # LaunchAgent configuration
     label = f"com.selfai.{repo_path.name}"
     plist_path = Path.home() / 'Library' / 'LaunchAgents' / f'{label}.plist'
-
     python_path = sys.executable
 
     plist_content = f'''<?xml version="1.0" encoding="UTF-8"?>
@@ -65,21 +59,17 @@ def install_launchagent():
 </dict>
 </plist>'''
 
-    # Ensure LaunchAgents directory exists
     plist_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Unload existing if present
     try:
         subprocess.run(['launchctl', 'unload', str(plist_path)],
                       capture_output=True, check=False)
     except Exception:
         pass
 
-    # Write plist
     plist_path.write_text(plist_content)
     print(f"Created LaunchAgent: {plist_path}")
 
-    # Load the agent
     result = subprocess.run(['launchctl', 'load', str(plist_path)],
                            capture_output=True, text=True)
 
@@ -87,12 +77,8 @@ def install_launchagent():
         print(f"LaunchAgent installed and started!")
         print(f"  - Runs every 3 minutes")
         print(f"  - Repository: {repo_path}")
-        print(f"  - Workspace: {workspace_path}")
     else:
         print(f"Failed to load LaunchAgent: {result.stderr}")
-        return False
-
-    return True
 
 
 def uninstall_launchagent():
@@ -107,41 +93,41 @@ def uninstall_launchagent():
         plist_path.unlink()
         print(f"LaunchAgent uninstalled: {label}")
     else:
-        print("No LaunchAgent found for this repository")
+        print("No LaunchAgent found")
 
 
 def show_status():
-    """Show current status with 3-level progression."""
+    """Show current status."""
     repo_path = get_repo_root()
-    runner = Runner(repo_path)
-    stats = runner.get_status()
-    level_stats = runner.db.get_level_stats()
+    runner = SelfAIRunner(repo_path)
+    stats = runner.db.get_stats()
 
-    print("\n=== SelfAI Status ===")
+    print("\n=== SelfAI Status (Planning-First Workflow) ===")
     print(f"Repository: {repo_path}")
 
-    print(f"\nFeatures:")
-    print(f"  Pending:     {stats.get('pending', 0)}")
-    print(f"  In Progress: {stats.get('in_progress', 0)}")
-    print(f"  Testing:     {stats.get('testing', 0)}")
-    print(f"  Completed:   {stats.get('completed', 0)} (all 3 levels done)")
-    print(f"  Total:       {stats.get('total', 0)}")
+    print(f"\nTask Status:")
+    for status, count in stats.items():
+        if count > 0:
+            print(f"  {status}: {count}")
 
-    print(f"\nLevel Progress:")
-    for level, name in [(1, 'MVP'), (2, 'Enhanced'), (3, 'Advanced')]:
-        lvl = level_stats.get(level, {})
-        passed = lvl.get('passed', 0)
-        in_prog = lvl.get('in_progress', 0)
-        print(f"  {name}: {passed} passed, {in_prog} in progress")
+    # Show plan_review tasks that need attention
+    review_tasks = runner.db.get_plan_review_tasks()
+    if review_tasks:
+        print(f"\n⚠️  Plans Awaiting Review:")
+        for task in review_tasks[:5]:
+            print(f"  #{task['id']}: {task['title']}")
+        if len(review_tasks) > 5:
+            print(f"  ... and {len(review_tasks) - 5} more")
+        print(f"\n  Use: python -m selfai approve <id>")
+        print(f"  Or:  python -m selfai feedback <id> \"your feedback\"")
 
-    # Check if LaunchAgent is installed
-    label = f"com.selfai.{repo_path.name}"
-    plist_path = Path.home() / 'Library' / 'LaunchAgents' / f'{label}.plist'
-
-    if plist_path.exists():
-        print(f"\nLaunchAgent: Installed (runs every 3 minutes)")
-    else:
-        print(f"\nLaunchAgent: Not installed (run 'python -m selfai install')")
+    # Show cancelled tasks
+    cancelled = runner.db.get_cancelled_tasks()
+    if cancelled:
+        print(f"\n❌ Cancelled Tasks (need feedback):")
+        for task in cancelled[:3]:
+            print(f"  #{task['id']}: {task['title']}")
+        print(f"\n  Use: python -m selfai reenable <id> [\"feedback\"]")
 
 
 def open_dashboard():
@@ -149,48 +135,11 @@ def open_dashboard():
     repo_path = get_repo_root()
     dashboard_path = repo_path / '.selfai_data' / 'dashboard.html'
 
-    # Always regenerate dashboard with latest stats
-    runner = Runner(repo_path)
+    runner = SelfAIRunner(repo_path)
     runner.update_dashboard()
 
     webbrowser.open(f'file://{dashboard_path}')
     print(f"Opened dashboard: {dashboard_path}")
-
-
-def analyze_logs():
-    """Analyze recent logs and display issues found."""
-    repo_path = get_repo_root()
-    runner = Runner(repo_path)
-
-    print("\n=== Log Analysis ===")
-    print(f"Repository: {repo_path}")
-
-    # Run analysis
-    analysis = runner.log_analyzer.analyze_logs()
-
-    print(f"\nLog Summary:")
-    print(f"  Lines analyzed: {analysis.get('log_lines', 0)}")
-    print(f"  Issues found:   {analysis.get('issues_found', 0)}")
-
-    # Display issues
-    issues = analysis.get('issues', [])
-    if issues:
-        print(f"\nRecent Issues:")
-        for i, issue in enumerate(issues, 1):
-            issue_type = issue.get('type', 'unknown').upper()
-            detail = issue.get('detail', 'No details')[:80]
-            timestamp = issue.get('timestamp', '')[:19]
-            print(f"  {i}. [{issue_type}] {detail}")
-            print(f"     Time: {timestamp}")
-    else:
-        print("\n  No issues detected in recent logs.")
-
-    # Show log file location
-    log_file = runner.log_analyzer.logs_path / 'runner.log'
-    if log_file.exists():
-        print(f"\nLog file: {log_file}")
-
-    print()
 
 
 def run_once():
@@ -198,171 +147,153 @@ def run_once():
     repo_path = get_repo_root()
     print(f"Running SelfAI for: {repo_path}")
 
-    runner = Runner(repo_path)
-    runner.run_once()
+    runner = SelfAIRunner(repo_path)
+    runner.run()
 
-    stats = runner.get_status()
-    print(f"\nStatus: {stats['completed']} completed, {stats['in_progress']} in progress, {stats['pending']} pending")
+    stats = runner.db.get_stats()
+    print(f"\nStatus: {stats.get('completed', 0)} completed, {stats.get('in_progress', 0)} in progress")
+    print(f"        {stats.get('plan_review', 0)} awaiting review, {stats.get('pending', 0)} pending")
 
 
-def add_improvement(title: str, description: str = '', category: str = 'general',
-                    priority: int = 50):
-    """Add a manual improvement (starts at MVP level)."""
+def add_improvement(title: str, description: str = ''):
+    """Add a new improvement task."""
     repo_path = get_repo_root()
-    runner = Runner(repo_path)
+    runner = SelfAIRunner(repo_path)
 
     imp_id = runner.db.add(
         title=title,
         description=description,
-        category=category,
-        priority=priority,
         source='manual'
     )
 
     runner.update_dashboard()
-    print(f"Added improvement #{imp_id}: {title}")
+    print(f"Added task #{imp_id}: {title}")
+    print("  Status: pending (will be planned on next run)")
 
 
-def test_feature(feature_id: int, verbose: bool = False):
-    """Test a specific feature by ID."""
+def approve_plan(task_id: int):
+    """Approve a plan for execution."""
     repo_path = get_repo_root()
+    runner = SelfAIRunner(repo_path)
 
-    try:
-        runner = Runner(repo_path)
-    except Exception as e:
-        print(f"Error initializing runner: {e}")
-        if verbose:
-            import traceback
-            traceback.print_exc()
+    task = runner.db.get_by_id(task_id)
+    if not task:
+        print(f"Error: Task #{task_id} not found")
         return
 
-    can_test, reason = runner.db.can_test_feature(feature_id)
-    if not can_test:
-        print(f"\nError: Cannot test feature #{feature_id}")
-        print(f"Reason: {reason}")
-        print("\nTroubleshooting:")
-        print("  - Check that the feature exists with: python -m selfai status")
-        print("  - Ensure feature has been implemented (status should be 'testing' or 'in_progress')")
-        print("  - Verify retry count hasn't exceeded maximum (3)")
+    if task['status'] != 'plan_review':
+        print(f"Error: Task #{task_id} is not awaiting review (status: {task['status']})")
         return
 
-    feature = runner.db.get_by_id(feature_id)
-    if not feature:
-        print(f"\nError: Feature #{feature_id} not found in database")
-        print("\nUse 'python -m selfai status' to see available features")
+    runner.db.approve_plan(task_id)
+    runner.update_dashboard()
+    print(f"✅ Approved plan for #{task_id}: {task['title']}")
+    print("  Will be executed on next run")
+
+
+def provide_feedback(task_id: int, feedback: str):
+    """Provide feedback on a plan."""
+    repo_path = get_repo_root()
+    runner = SelfAIRunner(repo_path)
+
+    task = runner.db.get_by_id(task_id)
+    if not task:
+        print(f"Error: Task #{task_id} not found")
         return
 
-    retry_count = feature.get('retry_count', 0)
-    level = feature.get('current_level', 1)
-    level_name = {1: 'MVP', 2: 'Enhanced', 3: 'Advanced'}[level]
-    max_retries = 3
+    if task['status'] != 'plan_review':
+        print(f"Error: Task #{task_id} is not awaiting review (status: {task['status']})")
+        return
 
-    print(f"\nTesting Feature #{feature_id}")
-    print(f"  Title: {feature['title']}")
-    print(f"  Level: {level_name} ({level}/3)")
-    print(f"  Retry: {retry_count}/{max_retries}")
-    print(f"  Status: {feature['status']}")
+    runner.db.request_plan_feedback(task_id, feedback)
+    runner.update_dashboard()
+    print(f"📝 Feedback submitted for #{task_id}")
+    print("  Plan will be revised on next run")
 
-    if verbose:
-        print(f"\n  Description: {feature.get('description', 'N/A')}")
-        print(f"  Category: {feature.get('category', 'N/A')}")
-        print(f"  Priority: {feature.get('priority', 'N/A')}")
-        if feature.get('error'):
-            print(f"  Last Error: {feature['error']}")
 
-    print("\nRunning tests...")
+def reenable_task(task_id: int, feedback: str = ''):
+    """Re-enable a cancelled task."""
+    repo_path = get_repo_root()
+    runner = SelfAIRunner(repo_path)
 
-    try:
-        runner._run_tests(feature)
+    task = runner.db.get_by_id(task_id)
+    if not task:
+        print(f"Error: Task #{task_id} not found")
+        return
 
-        updated = runner.db.get_by_id(feature_id)
-        if updated:
-            level_col = {1: 'mvp', 2: 'enhanced', 3: 'advanced'}[level]
-            test_status = updated.get(f'{level_col}_test_status', 'pending')
+    if task['status'] != 'cancelled':
+        print(f"Error: Task #{task_id} is not cancelled (status: {task['status']})")
+        return
 
-            print(f"\nTest Result: {test_status.upper()}")
+    runner.db.re_enable_cancelled(task_id, feedback)
+    runner.update_dashboard()
+    print(f"🔄 Re-enabled task #{task_id}: {task['title']}")
+    print("  Will be re-planned on next run")
 
-            if test_status == 'failed':
-                new_retry = updated.get('retry_count', 0)
-                if new_retry >= max_retries:
-                    print(f"  Status: Max retries reached - feature marked as permanently failed")
-                    print(f"  Action: Review test output and implementation before re-enabling")
-                else:
-                    print(f"  Status: Will retry (attempt {new_retry + 1}/{max_retries})")
-                    print(f"  Action: Feature moved back to pending queue")
-            elif test_status == 'passed':
-                print(f"  Status: Feature completed successfully at {level_name} level")
-                if level < 3:
-                    print(f"  Action: Can optionally enhance to level {level + 1}")
 
-            if verbose and updated.get(f'{level_col}_test_output'):
-                print(f"\nTest Output:")
-                output = updated.get(f'{level_col}_test_output', '')
-                if len(output) > 1000:
-                    print(output[:1000])
-                    print(f"\n... (truncated, {len(output)} total characters)")
-                else:
-                    print(output)
-        else:
-            print("\nError: Could not retrieve updated feature status")
-            print("Database may be corrupted or locked")
+def show_plan(task_id: int):
+    """Show the plan for a task."""
+    repo_path = get_repo_root()
+    runner = SelfAIRunner(repo_path)
 
-    except KeyboardInterrupt:
-        print("\n\nTest interrupted by user")
-        print("Feature will remain in current state")
-    except Exception as e:
-        print(f"\nError running tests: {e}")
-        print("\nPossible causes:")
-        print("  - Claude API connection issues")
-        print("  - Missing worktree or implementation files")
-        print("  - Database access problems")
-        if verbose:
-            print("\nFull traceback:")
-            import traceback
-            traceback.print_exc()
+    task = runner.db.get_by_id(task_id)
+    if not task:
+        print(f"Error: Task #{task_id} not found")
+        return
+
+    print(f"\n=== Plan for #{task_id}: {task['title']} ===")
+    print(f"Status: {task['status']}")
+    print(f"Test Count: {task.get('test_count', 0)}/3")
+
+    plan = task.get('plan_content', '')
+    if plan:
+        print(f"\n{plan}")
+    else:
+        print("\nNo plan generated yet")
+
+    if task.get('user_feedback'):
+        print(f"\n--- User Feedback ---")
+        print(task['user_feedback'])
 
 
 def print_help():
     """Print usage help."""
     print("""
-SelfAI - Autonomous Self-Improving System with MVP Testing & Progressive Complexity
+SelfAI - Planning-First Autonomous Improvement System
 
 Usage:
     python -m selfai <command> [options]
 
 Commands:
-    install      Install LaunchAgent (runs every 3 minutes)
-    uninstall    Remove LaunchAgent
-    run          Run a single improvement cycle (includes testing)
-    status       Show current status with complexity & test stats
-    dashboard    Open dashboard in browser
-    analyze-logs Analyze recent logs for errors and issues
-    add          Add a manual improvement
-    test         Test a specific feature by ID
-    help         Show this help
+    run              Run a single improvement cycle
+    status           Show current status with tasks awaiting review
+    dashboard        Open dashboard in browser
+    add "title"      Add a new improvement task
+    approve <id>     Approve a plan for execution
+    feedback <id> "msg"  Provide feedback to revise a plan
+    reenable <id>    Re-enable a cancelled task
+    plan <id>        View the full plan for a task
+    install          Install LaunchAgent (runs every 3 minutes)
+    uninstall        Remove LaunchAgent
+    help             Show this help
 
-Complexity Levels:
-    1 = MVP       (Simple, working implementations)
-    2 = Enhanced  (Robust with edge cases, unlocked after 5 tested MVP features)
-    3 = Advanced  (Production-ready, unlocked after 10 tested Enhanced features)
-
-Run Cycle:
-    1. Resume stuck tasks (if any)
-    2. Test completed features (MVP validation)
-    3. Process pending improvements (respecting complexity level)
-    4. Discover new improvements (if queue empty)
+Workflow:
+    1. Tasks start as 'pending'
+    2. Plans are generated with internet research
+    3. Plans go to 'plan_review' for your approval
+    4. Approved tasks are executed
+    5. Features are tested (max 3 attempts)
+    6. After 3 failures -> cancelled (needs feedback to re-enable)
 
 Examples:
-    python -m selfai install                  # Start autonomous improvements
-    python -m selfai run                      # Run once manually
-    python -m selfai status                   # Check progress & test status
-    python -m selfai dashboard                # View in browser
-    python -m selfai analyze-logs             # Check for errors in logs
-    python -m selfai add "Fix bug X"          # Add MVP-level task
-    python -m selfai test 5                   # Test feature #5
-    python -m selfai test 5 --verbose         # Test feature #5 with detailed output
-    python -m selfai add "Feature" "" "" 80 2 # Add Enhanced task (priority 80)
-    python -m selfai uninstall                # Stop autonomous runs
+    python -m selfai run                     # Run once manually
+    python -m selfai status                  # Check status
+    python -m selfai add "Add dark mode"     # Add new task
+    python -m selfai approve 5               # Approve plan #5
+    python -m selfai feedback 5 "Use CSS variables"  # Request changes
+    python -m selfai reenable 3              # Re-enable cancelled task
+    python -m selfai plan 5                  # View plan for task #5
+    python -m selfai dashboard               # Open dashboard
 """)
 
 
@@ -384,27 +315,51 @@ def main():
         show_status()
     elif command == 'dashboard':
         open_dashboard()
-    elif command == 'analyze-logs':
-        analyze_logs()
     elif command == 'add':
         if len(sys.argv) < 3:
-            print("Usage: python -m selfai add \"title\" [description] [category] [priority]")
+            print("Usage: python -m selfai add \"title\" [description]")
             return
         title = sys.argv[2]
         description = sys.argv[3] if len(sys.argv) > 3 else ''
-        category = sys.argv[4] if len(sys.argv) > 4 else 'general'
-        priority = int(sys.argv[5]) if len(sys.argv) > 5 else 50
-        add_improvement(title, description, category, priority)
-    elif command == 'test':
+        add_improvement(title, description)
+    elif command == 'approve':
         if len(sys.argv) < 3:
-            print("Usage: python -m selfai test <feature_id> [--verbose]")
+            print("Usage: python -m selfai approve <task_id>")
             return
         try:
-            feature_id = int(sys.argv[2])
-            verbose = '--verbose' in sys.argv or '-v' in sys.argv
-            test_feature(feature_id, verbose)
+            task_id = int(sys.argv[2])
+            approve_plan(task_id)
         except ValueError:
-            print("Error: feature_id must be an integer")
+            print("Error: task_id must be a number")
+    elif command == 'feedback':
+        if len(sys.argv) < 4:
+            print('Usage: python -m selfai feedback <task_id> "feedback message"')
+            return
+        try:
+            task_id = int(sys.argv[2])
+            feedback = sys.argv[3]
+            provide_feedback(task_id, feedback)
+        except ValueError:
+            print("Error: task_id must be a number")
+    elif command == 'reenable':
+        if len(sys.argv) < 3:
+            print('Usage: python -m selfai reenable <task_id> ["optional feedback"]')
+            return
+        try:
+            task_id = int(sys.argv[2])
+            feedback = sys.argv[3] if len(sys.argv) > 3 else ''
+            reenable_task(task_id, feedback)
+        except ValueError:
+            print("Error: task_id must be a number")
+    elif command == 'plan':
+        if len(sys.argv) < 3:
+            print("Usage: python -m selfai plan <task_id>")
+            return
+        try:
+            task_id = int(sys.argv[2])
+            show_plan(task_id)
+        except ValueError:
+            print("Error: task_id must be a number")
     elif command in ('help', '-h', '--help'):
         print_help()
     else:
