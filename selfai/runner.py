@@ -218,14 +218,17 @@ Be thorough and detailed. This plan will be reviewed by a human before execution
             else:
                 error = result.stderr or "No output from Claude"
                 logger.error(f"Plan generation failed for #{imp_id}: {error}")
-                self.db.mark_failed(imp_id, f"Plan generation failed: {error[:200]}")
+                # Reset to pending for retry on next run
+                self.db._update_status(imp_id, 'pending')
 
         except subprocess.TimeoutExpired:
             logger.error(f"Plan generation timed out for #{imp_id}")
-            self.db.mark_failed(imp_id, "Plan generation timed out")
+            # Reset to pending for retry
+            self.db._update_status(imp_id, 'pending')
         except Exception as e:
             logger.error(f"Plan generation error for #{imp_id}: {e}")
-            self.db.mark_failed(imp_id, str(e))
+            # Reset to pending for retry
+            self.db._update_status(imp_id, 'pending')
 
     def _execute_parallel(self, tasks: List[Dict]):
         """Execute tasks in parallel (max 5)."""

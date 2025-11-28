@@ -153,13 +153,14 @@ class Database:
             return [dict(row) for row in cursor.fetchall()]
 
     def get_tasks_for_testing(self, limit: int = MAX_PARALLEL_TASKS) -> List[Dict]:
-        """Get tasks that need testing."""
+        """Get tasks that need testing (only tasks that were implemented)."""
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute('''
                 SELECT * FROM improvements
-                WHERE status = 'testing' OR status = 'failed'
+                WHERE (status = 'testing' OR status = 'failed')
                 AND test_count < ?
+                AND output IS NOT NULL
                 ORDER BY priority DESC
                 LIMIT ?
             ''', (MAX_TEST_ATTEMPTS, limit))
