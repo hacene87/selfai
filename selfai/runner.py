@@ -500,6 +500,41 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
         dashboard_path.write_text(html)
         logger.info(f"Dashboard updated: {stats}")
 
+    def _generate_discovery_stats_html(self, discovery_stats: Dict) -> str:
+        """Generate discovery statistics HTML section."""
+        if not discovery_stats:
+            return ''
+
+        # Category icons
+        category_icons = {
+            'security': '🔒',
+            'test_coverage': '🧪',
+            'refactoring': '🔧',
+            'documentation': '📝',
+            'performance': '⚡',
+            'code_quality': '✨'
+        }
+
+        stat_cards = []
+        for category, count in discovery_stats.items():
+            icon = category_icons.get(category, '🔍')
+            display_name = category.replace('_', ' ').title()
+            stat_cards.append(f'''
+            <div class="stat-card" style="background: rgba(123, 44, 191, 0.2);">
+                <div class="value" style="color: #a78bfa">{icon} {count}</div>
+                <div class="label">{display_name}</div>
+            </div>
+            ''')
+
+        return f'''
+        <div style="margin: 20px 0;">
+            <h3 style="text-align: center; color: #a78bfa; margin-bottom: 10px;">🔍 Discovered Improvements</h3>
+            <div class="stats">
+                {''.join(stat_cards)}
+            </div>
+        </div>
+        '''
+
     def _generate_dashboard_html(self, stats: Dict, tasks: List[Dict], discovery_stats: Dict) -> str:
         """Generate dashboard HTML."""
         # Status colors
@@ -724,6 +759,8 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
                 <div class="label">Cancelled</div>
             </div>
         </div>
+
+        {self._generate_discovery_stats_html(discovery_stats) if discovery_stats else ''}
 
         <table>
             <thead>

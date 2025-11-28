@@ -313,6 +313,71 @@ def show_plan(task_id: int):
         print(task['user_feedback'])
 
 
+def show_monitoring_stats():
+    """Show monitoring and self-healing statistics."""
+    import sqlite3
+    repo_path = get_repo_root()
+    data_dir = repo_path / '.selfai_data'
+    healing_db_path = data_dir / 'healing.db'
+
+    if not healing_db_path.exists():
+        print("\nNo monitoring data available yet.")
+        print("Run 'python -m selfai run' to start monitoring.")
+        return
+
+    kb = KnowledgeBase(healing_db_path)
+    stats = kb.get_statistics()
+
+    print("\n=== Self-Healing Monitoring Statistics ===")
+    print(f"Repository: {repo_path}\n")
+
+    if not stats:
+        print("No healing attempts recorded yet.")
+        return
+
+    total_attempts = sum(s['total_attempts'] for s in stats.values())
+    total_successful = sum(s['successful'] for s in stats.values())
+    overall_rate = (total_successful / total_attempts * 100) if total_attempts > 0 else 0
+
+    print(f"Overall: {total_attempts} attempts, {total_successful} successful ({overall_rate:.1f}%)\n")
+    print("By Error Type:")
+    print("-" * 70)
+    print(f"{'Error Type':<25} {'Attempts':<12} {'Success':<12} {'Rate':<10}")
+    print("-" * 70)
+
+    for error_type, stat in sorted(stats.items(), key=lambda x: x[1]['total_attempts'], reverse=True):
+        success_rate = stat['success_rate'] * 100
+        print(f"{error_type:<25} {stat['total_attempts']:<12} {stat['successful']:<12} {success_rate:.1f}%")
+
+    print("\nRecent Healing History:")
+    print("-" * 70)
+
+    # Get recent history
+    try:
+        with sqlite3.connect(str(healing_db_path), timeout=30.0) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute('''
+                SELECT error_type, success, timestamp, diagnosis
+                FROM healing_history
+                ORDER BY timestamp DESC LIMIT 10
+            ''')
+            recent = [dict(row) for row in cursor.fetchall()]
+
+        if recent:
+            for record in recent:
+                status = "✅" if record['success'] else "❌"
+                timestamp = record['timestamp'][:19]  # Remove microseconds
+                print(f"{status} {timestamp} - {record['error_type']}")
+                if not record['success']:
+                    print(f"   Diagnosis: {record['diagnosis'][:60]}...")
+        else:
+            print("No recent healing attempts.")
+    except Exception as e:
+        print(f"Error reading history: {e}")
+
+    print("\n" + "=" * 70)
+
+
 def print_help():
     """Print usage help."""
     print("""
@@ -326,6 +391,7 @@ Commands:
     discover [cats]  Discover improvements (categories: security, test_coverage,
                      refactoring, documentation, performance, code_quality)
     status           Show current status with tasks awaiting review
+    monitor          Show self-healing monitoring statistics
     dashboard        Open dashboard in browser (starts server)
     serve [port]     Start dashboard server only (default port: 8787)
     add "title"      Add a new improvement task
@@ -446,6 +512,8 @@ def main():
             show_plan(task_id)
         except ValueError:
             print("Error: task_id must be a number")
+    elif command == 'monitor':
+        show_monitoring_stats()
     elif command in ('help', '-h', '--help'):
         print_help()
     else:
