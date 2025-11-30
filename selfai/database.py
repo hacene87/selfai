@@ -558,7 +558,7 @@ class Database:
             stats['total'] = cursor.fetchone()[0]
             return stats
 
-    def exists(self, title: str, similarity_threshold: float = 0.7) -> bool:
+    def exists(self, title: str, similarity_threshold: float = 0.55) -> bool:
         """Check if improvement with title or similar title already exists.
 
         Uses fuzzy matching to catch near-duplicates like:
@@ -570,10 +570,10 @@ class Database:
         # Normalize title for comparison
         title_normalized = title.lower().strip()
 
-        # Extract key words (remove common prefixes/suffixes)
-        key_words = set(title_normalized.replace('implement', '').replace('add', '')
-                       .replace('create', '').replace('for', '').replace('to', '')
-                       .replace('the', '').replace('and', '').replace('with', '').split())
+        # Extract key words (remove common prefixes/suffixes and noise words)
+        noise_words = {'implement', 'add', 'create', 'for', 'to', 'the', 'and', 'with',
+                      'of', 'in', 'on', 'a', 'an', 'cli', 'calls', 'system', 'feature'}
+        key_words = set(w for w in title_normalized.split() if w not in noise_words and len(w) > 2)
 
         with sqlite3.connect(self.db_path) as conn:
             # Exact match first
@@ -593,13 +593,13 @@ class Database:
                 if similarity >= similarity_threshold:
                     return True
 
-                # Check key word overlap
-                existing_words = set(existing_normalized.replace('implement', '').replace('add', '')
-                                    .replace('create', '').replace('for', '').replace('to', '')
-                                    .replace('the', '').replace('and', '').replace('with', '').split())
+                # Check key word overlap - use min to catch short titles contained in longer ones
+                existing_words = set(w for w in existing_normalized.split()
+                                    if w not in noise_words and len(w) > 2)
                 if key_words and existing_words:
-                    overlap = len(key_words & existing_words) / max(len(key_words), len(existing_words))
-                    if overlap >= 0.6:  # 60% word overlap = likely duplicate
+                    # Use min to catch "retry logic" in "retry logic for claude cli"
+                    overlap = len(key_words & existing_words) / min(len(key_words), len(existing_words))
+                    if overlap >= 0.6:  # 60% of shorter set overlaps
                         return True
 
             return False
