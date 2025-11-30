@@ -77,6 +77,28 @@ def _extract_json_from_output(output: str) -> Optional[dict | list]:
 CLAUDE_CMD = os.environ.get('CLAUDE_CMD', 'claude')
 
 
+def _create_subprocess_error_response(result: subprocess.CompletedProcess, context: str, timed_out: bool = False) -> dict:
+    """Create structured error response for failed Claude CLI calls.
+
+    Args:
+        result: CompletedProcess from subprocess.run
+        context: Description of operation (e.g., 'Diagnosis', 'Discovery')
+        timed_out: Whether the call timed out
+
+    Returns:
+        Dict with error diagnostics
+    """
+    return {
+        'error': True,
+        'context': context,
+        'returncode': result.returncode,
+        'stderr_snippet': result.stderr[:500] if result.stderr else '',
+        'stdout_length': len(result.stdout) if result.stdout else 0,
+        'timed_out': timed_out,
+        'timestamp': datetime.now().isoformat()
+    }
+
+
 def _log_subprocess_diagnostics(result: subprocess.CompletedProcess, context: str):
     """Log diagnostic information from subprocess call.
 
@@ -287,12 +309,27 @@ Format response as JSON:
                     return diagnosis
                 else:
                     logger.warning(f"Invalid diagnosis response for {issue['type']}")
-        except subprocess.TimeoutExpired:
+                    # Return structured error instead of falling through
+                    error_response = _create_subprocess_error_response(result, 'Diagnosis')
+                    self._store_error_pattern(error_response)
+                    return error_response
+            else:
+                # Non-zero returncode
+                error_response = _create_subprocess_error_response(result, 'Diagnosis')
+                self._store_error_pattern(error_response)
+                return error_response
+
+        except subprocess.TimeoutExpired as e:
             logger.error(f"Diagnosis timed out for {issue['type']}")
+            # Create error response from timeout exception
+            result = subprocess.CompletedProcess(args=e.cmd, returncode=-1, stdout=e.stdout or '', stderr=e.stderr or '')
+            error_response = _create_subprocess_error_response(result, 'Diagnosis', timed_out=True)
+            self._store_error_pattern(error_response)
+            return error_response
         except Exception as e:
             logger.error(f"Diagnosis failed: {e}")
-
-        return {'diagnosis': 'Unable to diagnose', 'confidence': 0.0}
+            # Generic error response
+            return {'error': True, 'context': 'Diagnosis', 'message': str(e), 'timestamp': datetime.now().isoformat()}
 
     def think_about_improvements(self, stats: Dict, repo_path: Path) -> List[Dict]:
         """Analyze patterns and suggest proactive improvements."""
@@ -345,12 +382,23 @@ Return JSON array:
                     return improvements
                 else:
                     logger.warning("Invalid improvement analysis response (expected list)")
-        except subprocess.TimeoutExpired:
+                    error_response = _create_subprocess_error_response(result, 'ImprovementAnalysis')
+                    self._store_error_pattern(error_response)
+                    return []  # Return empty list but log error
+            else:
+                error_response = _create_subprocess_error_response(result, 'ImprovementAnalysis')
+                self._store_error_pattern(error_response)
+                return []
+
+        except subprocess.TimeoutExpired as e:
             logger.error("Improvement analysis timed out")
+            result = subprocess.CompletedProcess(args=e.cmd, returncode=-1, stdout=e.stdout or '', stderr=e.stderr or '')
+            error_response = _create_subprocess_error_response(result, 'ImprovementAnalysis', timed_out=True)
+            self._store_error_pattern(error_response)
+            return []
         except Exception as e:
             logger.error(f"Improvement analysis failed: {e}")
-
-        return []
+            return []
 
     def _learn_from_fix(self, issue: Dict, diagnosis: Dict):
         """Store successful fix in pattern library for future reference."""
@@ -390,6 +438,32 @@ Return JSON array:
     def _save_patterns(self, patterns: List[Dict]):
         """Save pattern library to disk."""
         self.patterns_db.write_text(json.dumps(patterns, indent=2))
+
+    def _store_error_pattern(self, error_response: dict):
+        """Store subprocess error in patterns.json for trend analysis.
+
+        Args:
+            error_response: Structured error dict from _create_subprocess_error_response
+        """
+        patterns = self._load_patterns()
+
+        # Create pattern entry
+        error_pattern = {
+            'issue_type': 'subprocess_error',
+            'pattern': f"{error_response['context']}: returncode={error_response['returncode']}, timed_out={error_response['timed_out']}",
+            'diagnosis': error_response.get('stderr_snippet', 'No stderr'),
+            'confidence': 0.5,
+            'success_count': 1,
+            'timestamp': error_response['timestamp'],
+            'metadata': {
+                'stdout_length': error_response['stdout_length'],
+                'returncode': error_response['returncode'],
+                'timed_out': error_response['timed_out']
+            }
+        }
+
+        patterns.append(error_pattern)
+        self._save_patterns(patterns)
 
     def _check_pattern_library(self, issue: Dict) -> Optional[Dict]:
         """Check if issue matches known pattern."""

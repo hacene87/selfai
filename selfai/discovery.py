@@ -8,8 +8,31 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
+from datetime import datetime
 
 logger = logging.getLogger('selfai')
+
+
+def _create_subprocess_error_response(result: subprocess.CompletedProcess, context: str, timed_out: bool = False) -> dict:
+    """Create structured error response for failed Claude CLI calls.
+
+    Args:
+        result: CompletedProcess from subprocess.run
+        context: Description of operation (e.g., 'Diagnosis', 'Discovery')
+        timed_out: Whether the call timed out
+
+    Returns:
+        Dict with error diagnostics
+    """
+    return {
+        'error': True,
+        'context': context,
+        'returncode': result.returncode,
+        'stderr_snippet': result.stderr[:500] if result.stderr else '',
+        'stdout_length': len(result.stdout) if result.stdout else 0,
+        'timed_out': timed_out,
+        'timestamp': datetime.now().isoformat()
+    }
 
 
 class DiscoveryCategory(Enum):
@@ -229,16 +252,20 @@ Return JSON array:
 
             if result.returncode != 0:
                 logger.warning(f"Discovery failed for {category.value}: {result.stderr}")
-                return []
+                error_response = _create_subprocess_error_response(result, f'Discovery-{category.value}')
+                # Store error for tracking - return as list to match expected type
+                return [error_response]
 
             return self._parse_discovery_output(result.stdout, category)
 
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
             logger.warning(f"Discovery timed out for {category.value}")
-            return []
+            result = subprocess.CompletedProcess(args=e.cmd, returncode=-1, stdout=e.stdout or '', stderr=e.stderr or '')
+            error_response = _create_subprocess_error_response(result, f'Discovery-{category.value}', timed_out=True)
+            return [error_response]
         except Exception as e:
             logger.error(f"Discovery error for {category.value}: {e}")
-            return []
+            return [{'error': True, 'context': f'Discovery-{category.value}', 'message': str(e), 'timestamp': datetime.now().isoformat()}]
 
     def _parse_discovery_output(self, output: str, category: DiscoveryCategory) -> List[DiscoveredImprovement]:
         """Parse Claude's JSON output into DiscoveredImprovement objects."""
