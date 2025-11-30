@@ -767,22 +767,29 @@ class SelfAIRunner:
                         except Exception as e:
                             logger.error(f"Diagnosis failed for {issue['type']}: {e}")
 
-                # Think about improvements - Re-enabled
+                # Think about improvements - Re-enabled with better duplicate detection
                 if stats.get('completed', 0) > 5:  # After some successful runs
                     improvements = self.log_analyzer.think_about_improvements(
                         stats, self.repo_path
                     )
                     if improvements:
                         logger.info(f"Suggested {len(improvements)} improvements")
+                        added_count = 0
                         for imp in improvements:
-                            if not self.db.exists(imp['title']):
+                            title = imp['title']
+                            if self.db.exists(title):
+                                logger.debug(f"Skipping duplicate: {title}")
+                            else:
                                 self.db.add(
-                                    imp['title'],
+                                    title,
                                     imp.get('description', ''),
                                     imp.get('category', 'general'),
                                     imp.get('priority', 50),
                                     'log_analysis'
                                 )
+                                added_count += 1
+                                logger.info(f"Added improvement: {title}")
+                        logger.info(f"Added {added_count}/{len(improvements)} new improvements (rest were duplicates)")
             except Exception as e:
                 logger.error(f"Log analysis failed: {e}")
 
