@@ -558,11 +558,51 @@ class Database:
             stats['total'] = cursor.fetchone()[0]
             return stats
 
-    def exists(self, title: str) -> bool:
-        """Check if improvement with title already exists."""
+    def exists(self, title: str, similarity_threshold: float = 0.7) -> bool:
+        """Check if improvement with title or similar title already exists.
+
+        Uses fuzzy matching to catch near-duplicates like:
+        - "Add retry logic" vs "Implement retry logic"
+        - "Add health check" vs "Add health check endpoint"
+        """
+        from difflib import SequenceMatcher
+
+        # Normalize title for comparison
+        title_normalized = title.lower().strip()
+
+        # Extract key words (remove common prefixes/suffixes)
+        key_words = set(title_normalized.replace('implement', '').replace('add', '')
+                       .replace('create', '').replace('for', '').replace('to', '')
+                       .replace('the', '').replace('and', '').replace('with', '').split())
+
         with sqlite3.connect(self.db_path) as conn:
+            # Exact match first
             cursor = conn.execute("SELECT 1 FROM improvements WHERE title = ?", (title,))
-            return cursor.fetchone() is not None
+            if cursor.fetchone() is not None:
+                return True
+
+            # Get all existing titles for fuzzy matching
+            cursor = conn.execute("SELECT title FROM improvements WHERE status != 'cancelled'")
+            existing_titles = [row[0] for row in cursor.fetchall()]
+
+            for existing in existing_titles:
+                existing_normalized = existing.lower().strip()
+
+                # Check string similarity
+                similarity = SequenceMatcher(None, title_normalized, existing_normalized).ratio()
+                if similarity >= similarity_threshold:
+                    return True
+
+                # Check key word overlap
+                existing_words = set(existing_normalized.replace('implement', '').replace('add', '')
+                                    .replace('create', '').replace('for', '').replace('to', '')
+                                    .replace('the', '').replace('and', '').replace('with', '').split())
+                if key_words and existing_words:
+                    overlap = len(key_words & existing_words) / max(len(key_words), len(existing_words))
+                    if overlap >= 0.6:  # 60% word overlap = likely duplicate
+                        return True
+
+            return False
 
     def get_active_count(self) -> int:
         """Get count of active tasks (in_progress + testing)."""
