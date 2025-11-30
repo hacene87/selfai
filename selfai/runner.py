@@ -76,6 +76,55 @@ def _extract_json_from_output(output: str) -> Optional[dict | list]:
 # Claude CLI command
 CLAUDE_CMD = os.environ.get('CLAUDE_CMD', 'claude')
 
+
+def _log_subprocess_diagnostics(result: subprocess.CompletedProcess, context: str):
+    """Log diagnostic information from subprocess call.
+
+    Args:
+        result: CompletedProcess object from subprocess.run()
+        context: Description of what the subprocess was doing (e.g., 'Diagnosis')
+    """
+    logger.debug(f"[{context}] subprocess returncode: {result.returncode}")
+    logger.debug(f"[{context}] stdout length: {len(result.stdout) if result.stdout else 0} chars")
+
+    if result.stderr:
+        logger.warning(f"[{context}] stderr: {result.stderr[:500]}")
+
+    if not result.stdout or not result.stdout.strip():
+        logger.warning(f"[{context}] EMPTY stdout detected - Claude CLI returned no output")
+
+
+def retry_with_backoff(max_attempts: int = 3, base_delay: int = 2):
+    """Decorator for retrying subprocess calls with exponential backoff.
+
+    Args:
+        max_attempts: Maximum number of retry attempts (default: 3)
+        base_delay: Base delay in seconds, doubles with each retry (default: 2)
+                   Results in delays of 2s, 4s, 8s for 3 attempts
+
+    Returns:
+        Decorator function that wraps subprocess calls with retry logic
+    """
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                    last_exception = e
+                    if attempt == max_attempts:
+                        logger.error(f"Max retries ({max_attempts}) reached for {func.__name__}: {e}")
+                        raise
+                    delay = base_delay * (2 ** (attempt - 1))
+                    logger.warning(f"Attempt {attempt}/{max_attempts} failed for {func.__name__}, retrying in {delay}s: {e}")
+                    time.sleep(delay)
+            if last_exception:
+                raise last_exception
+        return wrapper
+    return decorator
+
+
 # Level guidance for the 3-level complexity system
 LEVEL_GUIDANCE = {
     1: {  # MVP Level
@@ -644,23 +693,22 @@ class SelfAIRunner:
                         except Exception as e:
                             logger.error(f"Diagnosis failed for {issue['type']}: {e}")
 
-                # Think about improvements - DISABLED to focus on existing tasks
-                # if stats.get('completed', 0) > 5:  # After some successful runs
-                #     improvements = self.log_analyzer.think_about_improvements(
-                #         stats, self.repo_path
-                #     )
-                #     if improvements:
-                #         logger.info(f"Suggested {len(improvements)} improvements")
-                #         for imp in improvements:
-                #             if not self.db.exists(imp['title']):
-                #                 self.db.add(
-                #                     imp['title'],
-                #                     imp.get('description', ''),
-                #                     imp.get('category', 'general'),
-                #                     imp.get('priority', 50),
-                #                     'log_analysis'
-                #                 )
-                pass  # Feature discovery disabled
+                # Think about improvements - Re-enabled
+                if stats.get('completed', 0) > 5:  # After some successful runs
+                    improvements = self.log_analyzer.think_about_improvements(
+                        stats, self.repo_path
+                    )
+                    if improvements:
+                        logger.info(f"Suggested {len(improvements)} improvements")
+                        for imp in improvements:
+                            if not self.db.exists(imp['title']):
+                                self.db.add(
+                                    imp['title'],
+                                    imp.get('description', ''),
+                                    imp.get('category', 'general'),
+                                    imp.get('priority', 50),
+                                    'log_analysis'
+                                )
             except Exception as e:
                 logger.error(f"Log analysis failed: {e}")
 
