@@ -58,13 +58,17 @@ class SelfHealingMonitor:
         # Metrics
         self.errors_detected = 0
         self.healings_attempted = 0
+
+        # Deduplication: track recently processed error types
+        self._recent_errors = {}  # error_type -> last_processed_time
+        self._error_cooldown = 60  # seconds to skip duplicate errors
         self.healings_successful = 0
 
         # Thread control
         self._running = False
         self._health_check_thread = None
 
-        logger.info(f"Initialized SelfHealingMonitor (auto_heal={auto_heal}, min_confidence={min_confidence})")
+        logger.debug(f"Initialized SelfHealingMonitor (auto_heal={auto_heal}, min_confidence={min_confidence})")
 
     def _load_default_config(self) -> Dict:
         """Load default configuration."""
@@ -151,8 +155,18 @@ class SelfHealingMonitor:
         Args:
             error: Detected error to process
         """
+        # Deduplication: skip if we recently processed this error type
+        current_time = time.time()
+        error_key = error.pattern_type
+        last_processed = self._recent_errors.get(error_key, 0)
+
+        if current_time - last_processed < self._error_cooldown:
+            # Skip duplicate error within cooldown period
+            return
+
+        self._recent_errors[error_key] = current_time
         self.errors_detected += 1
-        logger.info(f"Processing detected error: {error.pattern_type}")
+        logger.debug(f"Processing detected error: {error.pattern_type}")
 
         try:
             # Analyze (MAPE-K Analyze phase)
@@ -160,7 +174,7 @@ class SelfHealingMonitor:
 
             # Plan (implicit in diagnosis)
             if diagnosis.confidence < self.min_confidence:
-                logger.warning(
+                logger.debug(
                     f'Low confidence diagnosis ({diagnosis.confidence:.2f}), '
                     f'skipping auto-heal: {error.pattern_type}'
                 )

@@ -446,7 +446,7 @@ Focus on maintaining functionality from both branches.
         Returns:
             Number of worktrees cleaned up
         """
-        logger.info("Pruning orphaned worktrees...")
+        logger.debug("Pruning orphaned worktrees...")
 
         try:
             # Use git worktree prune

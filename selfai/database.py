@@ -405,26 +405,52 @@ class Database:
             return True
 
     def mark_testing(self, imp_id: int, output: str = '') -> bool:
-        """Mark task as ready for testing."""
+        """Mark task as ready for testing and update level status."""
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute('''
+            # Get current level to update the appropriate level status
+            cursor = conn.execute('SELECT current_level FROM improvements WHERE id = ?', (imp_id,))
+            row = cursor.fetchone()
+            current_level = row[0] if row else 1
+
+            # Update level status based on current level
+            level_status_col = {1: 'mvp_status', 2: 'enhanced_status', 3: 'advanced_status'}[current_level]
+
+            conn.execute(f'''
                 UPDATE improvements
-                SET status = 'testing', output = ?
+                SET status = 'testing', output = ?, {level_status_col} = 'testing'
                 WHERE id = ?
             ''', (output, imp_id))
             conn.commit()
             return True
 
     def mark_test_passed(self, imp_id: int, test_output: str = '') -> bool:
-        """Test passed - mark as completed."""
+        """Test passed - mark as completed and update level status."""
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute('''
+            # Get current level to update the appropriate level status
+            cursor = conn.execute('SELECT current_level FROM improvements WHERE id = ?', (imp_id,))
+            row = cursor.fetchone()
+            current_level = row[0] if row else 1
+
+            # Determine which level statuses to mark as completed
+            level_updates = []
+            if current_level >= 1:
+                level_updates.append("mvp_status = 'completed'")
+            if current_level >= 2:
+                level_updates.append("enhanced_status = 'completed'")
+            if current_level >= 3:
+                level_updates.append("advanced_status = 'completed'")
+
+            level_sql = ", ".join(level_updates) if level_updates else ""
+            if level_sql:
+                level_sql = ", " + level_sql
+
+            conn.execute(f'''
                 UPDATE improvements
-                SET status = 'completed', test_output = ?, completed_at = ?
+                SET status = 'completed', test_output = ?, completed_at = ?{level_sql}
                 WHERE id = ?
             ''', (test_output, datetime.now().isoformat(), imp_id))
             conn.commit()
-            logger.info(f"Feature #{imp_id} completed successfully!")
+            logger.info(f"Feature #{imp_id} completed successfully at level {current_level}!")
             return True
 
     def mark_test_failed(self, imp_id: int, test_output: str = '') -> bool:

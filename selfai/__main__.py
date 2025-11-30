@@ -528,8 +528,6 @@ Commands:
                      refactoring, documentation, performance, code_quality)
     status           Show current status with tasks awaiting review
     stuck            Show stuck in-progress tasks (may be from crashes)
-    levels           Show 3-level progression status (MVP/Enhanced/Advanced)
-    progress <id>    Show level progress for a specific feature
     monitor          Show self-healing monitoring statistics
     analyze-logs     Analyze system logs for errors and patterns
     diagnose         Diagnose issues found in logs using AI
@@ -653,17 +651,6 @@ def main():
         try:
             task_id = int(sys.argv[2])
             show_plan(task_id)
-        except ValueError:
-            print("Error: task_id must be a number")
-    elif command == 'levels':
-        show_levels()
-    elif command == 'progress':
-        if len(sys.argv) < 3:
-            print("Usage: python -m selfai progress <task_id>")
-            return
-        try:
-            task_id = int(sys.argv[2])
-            show_feature_progress(task_id)
         except ValueError:
             print("Error: task_id must be a number")
     elif command == 'monitor':

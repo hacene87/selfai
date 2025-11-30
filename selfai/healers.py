@@ -86,7 +86,7 @@ class ErrorAnalyzer:
             context={'similar_cases_count': len(similar_cases)}
         )
 
-        logger.info(f"Diagnosed '{error.pattern_type}': {root_cause} (confidence: {confidence:.2f})")
+        logger.debug(f"Diagnosed '{error.pattern_type}': {root_cause} (confidence: {confidence:.2f})")
         return diagnosis
 
     def _determine_root_cause(self, error: DetectedError) -> str:

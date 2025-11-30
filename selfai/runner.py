@@ -32,6 +32,47 @@ from .exceptions import ValidationError, GitOperationError
 
 logger = logging.getLogger('selfai')
 
+
+def _extract_json_from_output(output: str) -> Optional[dict | list]:
+    """
+    Safely extract JSON from Claude CLI output.
+
+    Handles cases where:
+    - Output is empty
+    - Output contains markdown code blocks
+    - Output has text before/after JSON
+    - JSON is malformed
+    """
+    if not output or not output.strip():
+        logger.warning("Empty output from Claude CLI")
+        return None
+
+    text = output.strip()
+
+    # Try to extract from markdown code blocks first
+    import re
+    json_block = re.search(r'```(?:json)?\s*([\s\S]*?)```', text)
+    if json_block:
+        text = json_block.group(1).strip()
+
+    # Try direct parse
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Try to find JSON object or array in the text
+    for pattern in [r'(\{[\s\S]*\})', r'(\[[\s\S]*\])']:
+        match = re.search(pattern, text)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except json.JSONDecodeError:
+                continue
+
+    logger.warning(f"Could not extract JSON from output (first 200 chars): {text[:200]}")
+    return None
+
 # Claude CLI command
 CLAUDE_CMD = os.environ.get('CLAUDE_CMD', 'claude')
 
@@ -187,14 +228,19 @@ Format response as JSON:
         try:
             result = subprocess.run(
                 [self.claude_cmd, '-p', prompt, '--allowedTools', 'Read,Grep,Glob'],
-                capture_output=True, text=True, timeout=120, cwd=str(repo_path)
+                capture_output=True, text=True, timeout=180, cwd=str(repo_path)
             )
 
             if result.returncode == 0:
-                diagnosis = json.loads(result.stdout)
-                self._learn_from_fix(issue, diagnosis)
-                return diagnosis
-        except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception) as e:
+                diagnosis = _extract_json_from_output(result.stdout)
+                if diagnosis and isinstance(diagnosis, dict):
+                    self._learn_from_fix(issue, diagnosis)
+                    return diagnosis
+                else:
+                    logger.warning(f"Invalid diagnosis response for {issue['type']}")
+        except subprocess.TimeoutExpired:
+            logger.error(f"Diagnosis timed out for {issue['type']}")
+        except Exception as e:
             logger.error(f"Diagnosis failed: {e}")
 
         return {'diagnosis': 'Unable to diagnose', 'confidence': 0.0}
@@ -240,14 +286,19 @@ Return JSON array:
         try:
             result = subprocess.run(
                 [self.claude_cmd, '-p', prompt, '--allowedTools', 'Read,Grep,WebSearch'],
-                capture_output=True, text=True, timeout=180, cwd=str(repo_path)
+                capture_output=True, text=True, timeout=240, cwd=str(repo_path)
             )
 
             if result.returncode == 0:
-                improvements = json.loads(result.stdout)
-                self.save_improvements(improvements)
-                return improvements
-        except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception) as e:
+                improvements = _extract_json_from_output(result.stdout)
+                if improvements and isinstance(improvements, list):
+                    self.save_improvements(improvements)
+                    return improvements
+                else:
+                    logger.warning("Invalid improvement analysis response (expected list)")
+        except subprocess.TimeoutExpired:
+            logger.error("Improvement analysis timed out")
+        except Exception as e:
             logger.error(f"Improvement analysis failed: {e}")
 
         return []
@@ -593,22 +644,23 @@ class SelfAIRunner:
                         except Exception as e:
                             logger.error(f"Diagnosis failed for {issue['type']}: {e}")
 
-                # Think about improvements
-                if stats.get('completed', 0) > 5:  # After some successful runs
-                    improvements = self.log_analyzer.think_about_improvements(
-                        stats, self.repo_path
-                    )
-                    if improvements:
-                        logger.info(f"Suggested {len(improvements)} improvements")
-                        for imp in improvements:
-                            if not self.db.exists(imp['title']):
-                                self.db.add(
-                                    imp['title'],
-                                    imp.get('description', ''),
-                                    imp.get('category', 'general'),
-                                    imp.get('priority', 50),
-                                    'log_analysis'
-                                )
+                # Think about improvements - DISABLED to focus on existing tasks
+                # if stats.get('completed', 0) > 5:  # After some successful runs
+                #     improvements = self.log_analyzer.think_about_improvements(
+                #         stats, self.repo_path
+                #     )
+                #     if improvements:
+                #         logger.info(f"Suggested {len(improvements)} improvements")
+                #         for imp in improvements:
+                #             if not self.db.exists(imp['title']):
+                #                 self.db.add(
+                #                     imp['title'],
+                #                     imp.get('description', ''),
+                #                     imp.get('category', 'general'),
+                #                     imp.get('priority', 50),
+                #                     'log_analysis'
+                #                 )
+                pass  # Feature discovery disabled
             except Exception as e:
                 logger.error(f"Log analysis failed: {e}")
 
@@ -1174,10 +1226,6 @@ If tests FAIL, respond with: TEST_FAILED followed by the error details
 
     def _generate_dashboard_html(self, stats: Dict, tasks: List[Dict], discovery_stats: Dict) -> str:
         """Generate dashboard HTML."""
-        # Get level unlock status
-        enhanced_unlocked, enhanced_msg = self.db.is_level_unlocked(2)
-        advanced_unlocked, advanced_msg = self.db.is_level_unlocked(3)
-
         # Get recovery stats
         recovery_stats = self.db.get_recovery_stats()
         stuck_count = recovery_stats.get('stuck_count', 0)
